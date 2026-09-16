@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.6.1 - 2026-09-16
+#### Bug Fixes
+- respect no_wait - (a449f74) - Nathan Blair
+
+- - -
+
 ## 0.6.0 - 2026-09-12
 #### Features
 - re-release under new org and module - (9d6ffd3) - Nathan Blair
