@@ -164,6 +164,37 @@ func TestDiscover(t *testing.T) {
 		}
 	})
 
+	t.Run("answers not found instead of waiting when asked not to wait", func(t *testing.T) {
+		server, _ := newServer()
+
+		stream := asksWithoutWaiting(t.Context(), method)
+
+		assertCode(t, server.Discover(stream), codes.NotFound)
+
+		if got := stream.candidates(); len(got) != 0 {
+			t.Errorf("expected no candidates, got %v", got)
+		}
+	})
+
+	t.Run("answers not found once every address is reported dead when asked not to wait", func(t *testing.T) {
+		server, store := newServer()
+
+		if err := store.Add(t.Context(), "10.0.0.1:50054", testAnchor, []string{method}); err != nil {
+			t.Fatalf("failed to seed: %v", err)
+		}
+
+		stream := asksWithoutWaiting(t.Context(), method, "10.0.0.1:50054")
+
+		assertCode(t, server.Discover(stream), codes.NotFound)
+
+		if got := stream.candidates(); !slices.Equal(got, []string{"10.0.0.1:50054"}) {
+			t.Errorf("expected the one candidate offered first, got %v", got)
+		}
+		if got := store.Addresses(method); len(got) != 0 {
+			t.Errorf("expected the dead address removed, got %v", got)
+		}
+	})
+
 	t.Run("returns when the caller goes away while waiting", func(t *testing.T) {
 		server, store := newServer()
 

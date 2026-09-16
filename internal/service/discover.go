@@ -34,11 +34,13 @@ const (
 // entirely down blocks on a receive rather than asking again, and is woken by
 // the registration. Every registration wakes every waiting handler, whatever
 // method it was for; one that finds its own set still empty goes back to sleep.
+// A caller that asked with no_wait is answered NotFound at that point instead:
+// it is resolving one request and has nothing to wait for.
 func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
 	ctx := stream.Context()
 	log := logger.FromContext(ctx)
 
-	method, err := methodName(ctx, stream)
+	method, noWait, err := methodName(ctx, stream)
 	if err != nil {
 		return err
 	}
@@ -77,6 +79,12 @@ func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
 			log.WarnContext(ctx, "Store returned, drawing again", "error", storeErr)
 
 			continue
+		}
+
+		if noWait {
+			log.InfoContext(ctx, "No addresses for method, not waiting", "candidates_sent", sent)
+
+			return foundationerrors.NotFound(ctx, "method", method)
 		}
 
 		log.DebugContext(ctx, "No addresses for method, waiting", "candidates_sent", sent)
@@ -151,20 +159,21 @@ func (s *GRPCDServer) offer(
 	return false, nil
 }
 
-// methodName reads the method off the stream's first message.
-func methodName(ctx context.Context, stream grpcd.GRPCDService_DiscoverServer) (string, error) {
+// methodName reads the method off the stream's first message, and whether the
+// caller declines to wait for one that nothing serves.
+func methodName(ctx context.Context, stream grpcd.GRPCDService_DiscoverServer) (string, bool, error) {
 	request, err := stream.Recv()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	method := request.GetMethodName()
 
 	if violations := validate.MethodName(method); len(violations) > 0 {
-		return "", foundationerrors.InvalidArgument(ctx, "validation failed", violations...)
+		return "", false, foundationerrors.InvalidArgument(ctx, "validation failed", violations...)
 	}
 
-	return method, nil
+	return method, request.GetNoWait(), nil
 }
 
 // reportedDead removes an address the caller could not reach and tells the

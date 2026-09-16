@@ -193,6 +193,15 @@ func satisfiedAfter(ctx context.Context, method string, dead ...string) *discove
 	return stream
 }
 
+// asksWithoutWaiting builds a stream that requests method with no_wait set
+// and then reports each of dead as unreachable.
+func asksWithoutWaiting(ctx context.Context, method string, dead ...string) *discoverStream {
+	stream := asks(ctx, method, dead...)
+	stream.requests[0].request.NoWait = true
+
+	return stream
+}
+
 func (s *discoverStream) Context() context.Context { return s.ctx }
 
 func (s *discoverStream) Recv() (*grpcd.DiscoverRequest, error) {

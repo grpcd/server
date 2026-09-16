@@ -20,6 +20,7 @@ RUN CGO_ENABLED=0 go build -v -ldflags="-w -s" -o ${artifact_name} ${module_path
 
 FROM ghcr.io/grpc-ecosystem/grpc-health-probe:${grpc_health_probe_version} AS grpc-health-probe
 
+
 FROM scratch AS run
 ARG build_dir
 ARG artifact_name
