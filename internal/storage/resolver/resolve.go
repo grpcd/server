@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/cenkalti/backoff/v7"
+
 	"github.com/grpcd/server/internal/storage"
 	"github.com/grpcd/server/internal/storage/mock"
 	"github.com/grpcd/server/internal/storage/redis"
@@ -22,7 +24,7 @@ func Resolve(ctx context.Context, log *slog.Logger) (storage.Store, error) {
 
 	switch backend {
 	case "redis":
-		store := redis.NewRedisStore(address)
+		store := redis.NewRedisStore(address, func() backoff.BackOff { return backoff.NewExponentialBackOff() })
 
 		if err := store.Ping(ctx); err != nil {
 			return nil, fmt.Errorf("%w: %w", storage.ErrStorageNotReachable, err)

@@ -5,7 +5,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"git.sonicoriginal.software/grpc-testing/mocks/meter"
+	"github.com/pbrpc/connect-service/diagnostics"
+	"github.com/pbrpc/otel-testing/mocks/meter"
 
 	"github.com/grpcd/server/internal/storage/mock"
 )
@@ -20,25 +21,28 @@ func newStorageCheckServer(pingErr error) *GRPCDServer {
 }
 
 func TestStorageCheck(t *testing.T) {
-	t.Run("reports the store when it answers", func(t *testing.T) {
+	t.Run("reports the store reachable when it answers", func(t *testing.T) {
 		server := newStorageCheckServer(nil)
 
 		got, err := server.StorageCheck(t.Context())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got.State != "" {
-			t.Errorf("state = %q, want empty", got.State)
+		if got.GetState() != diagnostics.StateReachable {
+			t.Errorf("state = %q, want %q", got.GetState(), diagnostics.StateReachable)
 		}
-		if got.Details["name"] != "mock" {
-			t.Errorf("details name = %q, want %q", got.Details["name"], "mock")
+		if got.GetDetails()["name"] != "mock" {
+			t.Errorf("details name = %q, want %q", got.GetDetails()["name"], "mock")
 		}
-		if got.LastChecked == 0 {
+		if _, reported := got.GetDetails()["error"]; reported {
+			t.Errorf("details carry an error %q for a store that answered", got.GetDetails()["error"])
+		}
+		if got.GetLastChecked() == 0 {
 			t.Error("last checked was not recorded")
 		}
 	})
 
-	t.Run("reports the failure as the store's state", func(t *testing.T) {
+	t.Run("reports the store unreachable with the failure", func(t *testing.T) {
 		wantErr := errors.New("storage unreachable")
 		server := newStorageCheckServer(wantErr)
 
@@ -46,11 +50,14 @@ func TestStorageCheck(t *testing.T) {
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("error = %v, want %v", err, wantErr)
 		}
-		if got.State != wantErr.Error() {
-			t.Errorf("state = %q, want %q", got.State, wantErr.Error())
+		if got.GetState() != diagnostics.StateUnreachable {
+			t.Errorf("state = %q, want %q", got.GetState(), diagnostics.StateUnreachable)
 		}
-		if got.Details["name"] != "mock" {
-			t.Errorf("details name = %q, want %q", got.Details["name"], "mock")
+		if got.GetDetails()["error"] != wantErr.Error() {
+			t.Errorf("details error = %q, want %q", got.GetDetails()["error"], wantErr.Error())
+		}
+		if got.GetDetails()["name"] != "mock" {
+			t.Errorf("details name = %q, want %q", got.GetDetails()["name"], "mock")
 		}
 	})
 }

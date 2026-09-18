@@ -3,7 +3,7 @@ package validate
 import (
 	"fmt"
 
-	"git.sonicoriginal.software/grpc-foundation/errors"
+	errors "github.com/pbrpc/connect-errors"
 )
 
 // Methods validates a list of method names

@@ -5,22 +5,8 @@ import (
 	"strconv"
 	"testing"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	grpcd "github.com/grpcd/protos"
+	"connectrpc.com/connect/v2"
 )
-
-// endedStream is a registration stream whose caller is already gone, so the
-// handler runs its whole path — write, acknowledge, remove — without blocking.
-func endedStream(t *testing.T, address string) *registerStream {
-	t.Helper()
-
-	ctx, disconnect := context.WithCancel(peerContext(t.Context(), address))
-	disconnect()
-
-	return newRegisterStream(ctx)
-}
 
 // FuzzRegister_MethodNames validates that Register properly handles all possible method
 // name inputs, rejecting invalid names with InvalidArgument and accepting valid ones.
@@ -41,13 +27,16 @@ func FuzzRegister_MethodNames(f *testing.F) {
 	f.Add("/Service")
 
 	f.Fuzz(func(t *testing.T, methodName string) {
-		server, _ := newServer()
+		h := newHarness()
 
-		stream := endedStream(t, "192.168.1.100:41234")
+		ctx, disconnect := context.WithCancel(t.Context())
+		defer disconnect()
 
-		err := server.Register(
-			&grpcd.RegisterRequest{Methods: []string{methodName}, Port: 50054}, stream,
-		)
+		returned := h.registering()
+
+		// Acknowledged or refused; an acknowledged one runs its whole path,
+		// write, acknowledge, remove, once the caller leaves.
+		_, err := register(ctx, h.client(peer), registration(methodName))
 
 		isValid := isValidMethodName(methodName)
 
@@ -59,8 +48,10 @@ func FuzzRegister_MethodNames(f *testing.F) {
 				return
 			}
 
-			if stream.sends() != 1 {
-				t.Errorf("expected method name %q to be acknowledged", methodName)
+			disconnect()
+
+			if err := await(t, returned, "handler did not return"); err != nil {
+				t.Errorf("expected method name %q to be released cleanly, got error: %v", methodName, err)
 			}
 
 			return
@@ -73,19 +64,10 @@ func FuzzRegister_MethodNames(f *testing.F) {
 			return
 		}
 
-		st, ok := status.FromError(err)
-		if !ok {
-			t.Errorf(
-				"expected gRPC status error for invalid method name %q, got: %v", methodName, err,
-			)
-
-			return
-		}
-
-		if st.Code() != codes.InvalidArgument {
+		if got := connect.CodeOf(err); got != connect.CodeInvalidArgument {
 			t.Errorf(
 				"expected InvalidArgument for invalid method name %q, got %v",
-				methodName, st.Code(),
+				methodName, got,
 			)
 		}
 	})
@@ -109,7 +91,7 @@ func FuzzRegister_MethodCounts(f *testing.F) {
 			t.Skip()
 		}
 
-		server, store := newServer()
+		h := newHarness()
 
 		// Generate N valid method names in gRPC format
 		methods := make([]string, methodCount)
@@ -118,33 +100,33 @@ func FuzzRegister_MethodCounts(f *testing.F) {
 		}
 
 		// A stream that is still held, so the rows are there to assert on.
-		ctx, disconnect := context.WithCancel(peerContext(t.Context(), "192.168.1.100:41234"))
+		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
 
-		stream := newRegisterStream(ctx)
+		returned := h.registering()
 
-		returned := held(server, &grpcd.RegisterRequest{Methods: methods, Port: 50054}, stream)
+		_, err := register(ctx, h.client(peer), registration(methods...))
 
 		if methodCount == 0 {
 			// Should fail validation
-			err := await(t, returned, "handler did not return for zero methods")
 			if err == nil {
 				t.Fatal("expected error for zero methods, got nil")
 			}
 
-			st, ok := status.FromError(err)
-			if ok && st.Code() != codes.InvalidArgument {
-				t.Errorf("expected InvalidArgument for zero methods, got %v", st.Code())
+			if got := connect.CodeOf(err); got != connect.CodeInvalidArgument {
+				t.Errorf("expected InvalidArgument for zero methods, got %v", got)
 			}
 
 			return
 		}
 
-		await(t, stream.acknowledged(), "registration was never acknowledged")
+		if err != nil {
+			t.Fatalf("registration was never acknowledged: %v", err)
+		}
 
 		// Verify all methods were registered against the composed address
 		for _, method := range methods {
-			addresses := store.Addresses(method)
+			addresses := h.store.Addresses(method)
 
 			if len(addresses) != 1 || addresses[0] != "192.168.1.100:50054" {
 				t.Errorf("method %s holds %v", method, addresses)

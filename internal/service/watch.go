@@ -1,10 +1,13 @@
 package service
 
 import (
+	"context"
+
 	"git.sonicoriginal.software/logger"
 
-	"git.sonicoriginal.software/grpc-foundation/errors"
 	grpcd "github.com/grpcd/protos"
+	"github.com/grpcd/protos/grpcdconnect"
+	errors "github.com/pbrpc/connect-errors"
 
 	"github.com/grpcd/server/internal"
 	"github.com/grpcd/server/internal/validate"
@@ -38,12 +41,25 @@ func validateWatchRequest(req *grpcd.WatchRequest) []errors.FieldViolation {
 // share of them is exactly its fair share. The stream is held until the
 // client closes it, which it does once it has moved and opened a new Watch
 // naming where it went.
-func (s *GRPCDServer) Watch(req *grpcd.WatchRequest, stream grpcd.GRPCDService_WatchServer) error {
-	ctx := stream.Context()
-	log := logger.FromContext(ctx).With("method_name", req.MethodName, "held_address", req.Address)
+func (s *GRPCDServer) Watch(
+	ctx context.Context, req *grpcd.WatchRequest, stream grpcdconnect.GRPCDServiceWatchServerStream,
+) error {
+	log := logger.FromContext(ctx).With(
+		"peer_address", peerAddress(ctx), "method_name", req.MethodName, "held_address", req.Address,
+	)
 
 	if violations := validateWatchRequest(req); len(violations) > 0 {
 		return errors.InvalidArgument(ctx, "validation failed", violations...)
+	}
+
+	// The client closes the Discover that gave it the address only once this
+	// stream is open, and over HTTP a stream is open once its response headers
+	// are on the wire. connect-go v2's HTTP transport flushes them on the first
+	// Send and on nothing else, SendHeaders included, so an empty message goes
+	// first; the client takes it as the watch being held and reads no address
+	// from it.
+	if err := stream.Send(&grpcd.WatchResponse{}); err != nil {
+		return err
 	}
 
 	log.InfoContext(ctx, "Watching method")

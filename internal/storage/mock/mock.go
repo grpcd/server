@@ -39,10 +39,15 @@ type Store struct {
 
 	// Signals a test registers to act once a handler has reached a point it
 	// cannot otherwise observe: the next Add, the next injected failure, the
-	// next look at the condition.
+	// next look at the condition, the first look at it after a failure.
 	added       chan struct{}
 	failed      chan struct{}
 	conditioned chan struct{}
+	waiting     chan struct{}
+
+	// errored is set by an injected failure and cleared by the next look at
+	// the condition, which fires waiting.
+	errored bool
 
 	// exhausted is closed per method by the next draw that finds nothing, so a
 	// test can act once a handler has run out and is about to wait.
@@ -85,7 +90,7 @@ func (s *Store) Add(_ context.Context, address, anchor string, methods []string)
 	fire(&s.added)
 
 	if s.addErr != nil {
-		fire(&s.failed)
+		s.fail()
 
 		return s.addErr
 	}
@@ -186,7 +191,7 @@ func (s *Store) draw(method string) (address string, found bool, err error) {
 	defer s.mu.Unlock()
 
 	if s.addressesForErr != nil {
-		fire(&s.failed)
+		s.fail()
 
 		return "", false, s.addressesForErr
 	}
@@ -206,11 +211,11 @@ func (s *Store) draw(method string) (address string, found bool, err error) {
 
 // Count answers with how many addresses serve method.
 func (s *Store) Count(_ context.Context, method string) (int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.countErr != nil {
-		fire(&s.failed)
+		s.fail()
 
 		return 0, s.countErr
 	}
@@ -277,13 +282,42 @@ func (s *Store) Latest() *storage.Addition {
 }
 
 // Condition answers with the store's reachability, telling anything waiting
-// on Conditioned.
+// on Conditioned, and on Waiting when this is the first look since an
+// injected failure.
 func (s *Store) Condition() *storage.Condition {
 	s.mu.Lock()
 	fire(&s.conditioned)
+
+	if s.errored {
+		s.errored = false
+		fire(&s.waiting)
+	}
 	s.mu.Unlock()
 
 	return s.conditions.Current()
+}
+
+// fail tells anything waiting on Failed, and arms Waiting for the next look
+// at the condition. Called under mu.
+func (s *Store) fail() {
+	fire(&s.failed)
+	s.errored = true
+}
+
+// Changes yields the store's reachability as it changes, telling anything
+// waiting on Conditioned once the consumer has acted on each.
+func (s *Store) Changes(ctx context.Context) iter.Seq[*storage.Condition] {
+	return func(yield func(*storage.Condition) bool) {
+		for condition := range s.conditions.Changes(ctx) {
+			if !yield(condition) {
+				return
+			}
+
+			s.mu.Lock()
+			fire(&s.conditioned)
+			s.mu.Unlock()
+		}
+	}
 }
 
 // Adds answers with how many times Add was called, for assertions.
@@ -306,9 +340,18 @@ func (s *Store) Failed() <-chan struct{} {
 	return s.register(&s.failed)
 }
 
-// Conditioned answers with a channel closed by the next call to Condition.
+// Conditioned answers with a channel closed by the next call to Condition, or
+// by a Changes consumer finishing with the next condition yielded.
 func (s *Store) Conditioned() <-chan struct{} {
 	return s.register(&s.conditioned)
+}
+
+// Waiting answers with a channel closed by the first call to Condition after
+// the next injected failure: a handler judging that failure against the
+// store's condition, about to wait if the store is lost. A test registers it
+// before the handler can fail, then stages the recovery once it fires.
+func (s *Store) Waiting() <-chan struct{} {
+	return s.register(&s.waiting)
 }
 
 // register hands out a fresh signal for slot.

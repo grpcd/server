@@ -3,8 +3,7 @@ package service
 import (
 	"testing"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"connectrpc.com/connect/v2"
 )
 
 // FuzzDiscover_MethodNames validates that Discover properly handles all possible method
@@ -28,22 +27,20 @@ func FuzzDiscover_MethodNames(f *testing.F) {
 	f.Add("/Service")
 
 	f.Fuzz(func(t *testing.T, methodName string) {
-		server, store := newServer()
+		h := newHarness()
 
 		isValid := isValidMethodName(methodName)
 
 		const expectedAddr = "192.168.1.100:50054"
 
 		if isValid {
-			if err := store.Add(t.Context(), expectedAddr, testAnchor, []string{methodName}); err != nil {
+			if err := h.store.Add(t.Context(), expectedAddr, testAnchor, []string{methodName}); err != nil {
 				t.Fatalf("failed to seed valid method: %v", err)
 			}
 		}
 
 		// The caller takes the first candidate it is offered and closes.
-		stream := satisfiedAfter(t.Context(), methodName)
-
-		err := server.Discover(stream)
+		candidates, err := discover(t.Context(), h.client(""), methodName)
 
 		if !isValid {
 			// Invalid method names should return InvalidArgument
@@ -53,17 +50,10 @@ func FuzzDiscover_MethodNames(f *testing.F) {
 				return
 			}
 
-			st, ok := status.FromError(err)
-			if !ok {
-				t.Errorf("expected gRPC status error for invalid method name %q", methodName)
-
-				return
-			}
-
-			if st.Code() != codes.InvalidArgument {
+			if got := connect.CodeOf(err); got != connect.CodeInvalidArgument {
 				t.Errorf(
 					"expected InvalidArgument for invalid method name %q, got %v",
-					methodName, st.Code(),
+					methodName, got,
 				)
 			}
 
@@ -76,8 +66,6 @@ func FuzzDiscover_MethodNames(f *testing.F) {
 
 			return
 		}
-
-		candidates := stream.candidates()
 
 		if len(candidates) != 1 {
 			t.Errorf("expected one candidate for method %q, got %v", methodName, candidates)

@@ -8,8 +8,9 @@ import (
 
 	"git.sonicoriginal.software/logger"
 
-	foundationerrors "git.sonicoriginal.software/grpc-foundation/errors"
 	grpcd "github.com/grpcd/protos"
+	"github.com/grpcd/protos/grpcdconnect"
+	pbrpcerrors "github.com/pbrpc/connect-errors"
 
 	"github.com/grpcd/server/internal"
 	"github.com/grpcd/server/internal/storage"
@@ -36,9 +37,8 @@ const (
 // method it was for; one that finds its own set still empty goes back to sleep.
 // A caller that asked with no_wait is answered NotFound at that point instead:
 // it is resolving one request and has nothing to wait for.
-func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
-	ctx := stream.Context()
-	log := logger.FromContext(ctx)
+func (s *GRPCDServer) Discover(ctx context.Context, stream grpcdconnect.GRPCDServiceDiscoverServerStream) error {
+	log := logger.FromContext(ctx).With("peer_address", peerAddress(ctx))
 
 	method, noWait, err := methodName(ctx, stream)
 	if err != nil {
@@ -46,7 +46,7 @@ func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
 	}
 
 	log = log.With("method_name", method)
-	log.InfoContext(ctx, "Discovering method")
+	log.DebugContext(ctx, "Discovering method")
 
 	sent := 0
 
@@ -67,7 +67,7 @@ func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
 			if !lost {
 				log.ErrorContext(ctx, "Failed to discover method", "error", storeErr)
 
-				return foundationerrors.Internal(
+				return pbrpcerrors.Internal(
 					ctx, "failed to discover method", errCodeDiscoverFailed, internal.ErrDomain,
 				)
 			}
@@ -84,7 +84,7 @@ func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
 		if noWait {
 			log.InfoContext(ctx, "No addresses for method, not waiting", "candidates_sent", sent)
 
-			return foundationerrors.NotFound(ctx, "method", method)
+			return pbrpcerrors.NotFound(ctx, "method", method)
 		}
 
 		log.DebugContext(ctx, "No addresses for method, waiting", "candidates_sent", sent)
@@ -107,7 +107,7 @@ func (s *GRPCDServer) Discover(stream grpcd.GRPCDService_DiscoverServer) error {
 func (s *GRPCDServer) draw(
 	ctx context.Context,
 	log *slog.Logger,
-	stream grpcd.GRPCDService_DiscoverServer,
+	stream grpcdconnect.GRPCDServiceDiscoverServerStream,
 	method string,
 	sent *int,
 ) (done bool, storeErr, err error) {
@@ -132,14 +132,14 @@ func (s *GRPCDServer) draw(
 func (s *GRPCDServer) offer(
 	ctx context.Context,
 	log *slog.Logger,
-	stream grpcd.GRPCDService_DiscoverServer,
+	stream grpcdconnect.GRPCDServiceDiscoverServerStream,
 	method, address string,
 ) (bool, error) {
 	if err := stream.Send(&grpcd.DiscoverResponse{Address: address}); err != nil {
 		return false, err
 	}
 
-	reported, err := stream.Recv()
+	reported, err := stream.Receive()
 	if errors.Is(err, io.EOF) {
 		if s.methodsDiscovered != nil {
 			s.methodsDiscovered.Add(ctx, 1)
@@ -161,8 +161,10 @@ func (s *GRPCDServer) offer(
 
 // methodName reads the method off the stream's first message, and whether the
 // caller declines to wait for one that nothing serves.
-func methodName(ctx context.Context, stream grpcd.GRPCDService_DiscoverServer) (string, bool, error) {
-	request, err := stream.Recv()
+func methodName(
+	ctx context.Context, stream grpcdconnect.GRPCDServiceDiscoverServerStream,
+) (string, bool, error) {
+	request, err := stream.Receive()
 	if err != nil {
 		return "", false, err
 	}
@@ -170,7 +172,7 @@ func methodName(ctx context.Context, stream grpcd.GRPCDService_DiscoverServer) (
 	method := request.GetMethodName()
 
 	if violations := validate.MethodName(method); len(violations) > 0 {
-		return "", false, foundationerrors.InvalidArgument(ctx, "validation failed", violations...)
+		return "", false, pbrpcerrors.InvalidArgument(ctx, "validation failed", violations...)
 	}
 
 	return method, request.GetNoWait(), nil
@@ -211,26 +213,31 @@ func (s *GRPCDServer) reportedDead(
 	}
 }
 
-// Reinstate writes back a row removed from under this instance's anchor.
+// Reinstate hands a removal from under this instance's anchor to the Register
+// handlers holding a stream at the removed address, and each writes its
+// registration again. Nothing is written here: what the address serves is
+// known only to the stream that registered it.
 //
-// The store publishes only to the anchor recorded on the row, and that anchor
-// is gone once the registration stream ends, so a notification arriving means
-// this instance held the stream when the removal happened. That is proof enough
-// to write it back without checking anything.
-//
-// A stream that ended in the meantime leaves a row for a service that is gone,
-// and the next client to fail against it removes it again.
+// The store publishes only to the anchor recorded on the row, and the anchor
+// is recorded by address, so the row may be one an earlier occupant of the
+// address left behind. The handler writes what its request names and nothing
+// else, so such a row stays removed. An address no stream holds any more is a
+// stream that ended in the meantime, and the removal stands.
 func (s *GRPCDServer) Reinstate(ctx context.Context, removal storage.Removal) {
-	log := s.log.With("peer_address", removal.Address, "method_name", removal.Method)
+	holders := s.holders(removal.Address)
 
-	if err := s.store.Add(ctx, removal.Address, s.anchor, []string{removal.Method}); err != nil {
-		log.ErrorContext(ctx, "Failed to reinstate address", "error", err)
+	if len(holders) == 0 {
+		s.log.InfoContext(ctx, "Removed address is held by no stream",
+			"peer_address", removal.Address, "method_name", removal.Method)
+
 		return
 	}
 
-	if s.revertedRemovals != nil {
-		s.revertedRemovals.Add(ctx, 1)
+	for _, holder := range holders {
+		// A pending removal already covers this one.
+		select {
+		case holder <- removal:
+		default:
+		}
 	}
-
-	log.InfoContext(ctx, "Reinstated address removed while its stream is held")
 }

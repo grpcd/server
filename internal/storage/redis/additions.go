@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -12,59 +13,70 @@ import (
 // from that one announcement, so the subscription count does not grow with
 // the handlers waiting.
 //
-// The subscription is also how recovery is noticed. go-redis reconnects and
-// resubscribes on its own after a network error, and pings a quiet link so a
-// silent one is noticed, and each resubscription is delivered as a
-// Subscription: the first is this call succeeding, every later one is the
-// store coming back.
+// The subscription is the one connection to the backend that is always open,
+// so it is also how a loss is noticed without anything touching the store: a
+// receive that fails is the backend gone, and the store is lost from then
+// until the subscription is back. Every receive after a failure reconnects,
+// resolving the address again, so a backend brought back elsewhere under the
+// same name is found; the attempts are paced on the backoff schedule. The
+// confirmation of the resubscription is the store coming back.
 func (r *Store) Listen(ctx context.Context) error {
 	subscription := r.client.PSubscribe(ctx, additionsPattern)
 
-	messages := subscription.ChannelWithSubscriptions()
-
-	// Registered before returning, so an addition published after this call
+	// Confirmed before returning, so an addition published after this call
 	// is announced.
-	if err := confirmed(ctx, messages); err != nil {
+	if err := confirmed(ctx, subscription); err != nil {
 		subscription.Close()
 
 		return err
 	}
 
-	go func() {
-		defer subscription.Close()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case message, open := <-messages:
-				if !open {
-					return
-				}
-
-				r.announce(message)
-			}
-		}
-	}()
+	go r.receive(ctx, subscription)
 
 	return nil
 }
 
 // confirmed waits for the first subscription confirmation.
-func confirmed(ctx context.Context, messages <-chan interface{}) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case message, open := <-messages:
-		if !open {
-			return errors.New("subscription closed before it was confirmed")
+func confirmed(ctx context.Context, subscription *redis.PubSub) error {
+	message, err := subscription.Receive(ctx)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := message.(*redis.Subscription); !ok {
+		return errors.New("subscription delivered a message before it was confirmed")
+	}
+
+	return nil
+}
+
+// receive announces what the subscription delivers until ctx ends, marking
+// the store lost when a receive fails and pacing the reconnection it makes.
+func (r *Store) receive(ctx context.Context, subscription *redis.PubSub) {
+	defer subscription.Close()
+
+	schedule := r.newBackOff()
+
+	for ctx.Err() == nil {
+		message, err := subscription.Receive(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+
+			r.conditions.Lose()
+
+			select {
+			case <-time.After(schedule.NextBackOff()):
+			case <-ctx.Done():
+				return
+			}
+
+			continue
 		}
 
-		if _, ok := message.(*redis.Subscription); !ok {
-			return errors.New("subscription delivered a message before it was confirmed")
-		}
-
-		return nil
+		schedule.Reset()
+		r.announce(message)
 	}
 }
 

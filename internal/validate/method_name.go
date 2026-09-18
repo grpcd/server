@@ -1,6 +1,6 @@
 package validate
 
-import "git.sonicoriginal.software/grpc-foundation/errors"
+import errors "github.com/pbrpc/connect-errors"
 
 // MethodName validates a single method name
 // Must be in gRPC format (e.g., "/package.Service/Method")

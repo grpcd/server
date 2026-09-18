@@ -113,6 +113,10 @@ type Store interface {
 	// between is not slept through.
 	Condition() *Condition
 
+	// Changes yields the store's reachability as it changes, the current one
+	// first, until ctx ends. What reports the store's health ranges over it.
+	Changes(ctx context.Context) iter.Seq[*Condition]
+
 	// Ping checks storage connectivity
 	Ping(ctx context.Context) error
 

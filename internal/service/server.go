@@ -4,12 +4,13 @@ package service
 import (
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 
 	"go.opentelemetry.io/otel/metric"
 
 	"git.sonicoriginal.software/logger"
 
-	grpcd "github.com/grpcd/protos"
+	"github.com/grpcd/protos/grpcdconnect"
 
 	"github.com/grpcd/server/internal/storage"
 	"github.com/grpcd/server/internal/storage/mock"
@@ -22,7 +23,6 @@ const (
 
 // GRPCDServer implements the GRPCDService
 type GRPCDServer struct {
-	grpcd.UnimplementedGRPCDServiceServer
 	log    *slog.Logger
 	store  storage.Store
 	anchor string
@@ -31,6 +31,12 @@ type GRPCDServer struct {
 	// random in production; a test substitutes a deterministic answer.
 	roll func(n int64) bool
 
+	// held is every Register handler holding a stream, by the address it
+	// registered: the channel a removal at that address is handed on. What was
+	// registered is not kept here; the handler holds its own request.
+	heldMu sync.Mutex
+	held   map[string]map[chan storage.Removal]struct{}
+
 	// Business metrics
 	registrationCount metric.Int64Counter
 	removalCount      metric.Int64Counter
@@ -38,6 +44,8 @@ type GRPCDServer struct {
 	revertedRemovals  metric.Int64Counter
 	rebalanceCount    metric.Int64Counter
 }
+
+var _ grpcdconnect.GRPCDServiceHandler = (*GRPCDServer)(nil)
 
 // oneIn answers true with probability 1/n. A count of zero means the set
 // emptied between the announcement and the count, and nobody moves.
@@ -114,6 +122,7 @@ func NewGRPCDServer(
 		store:             store,
 		anchor:            anchor,
 		roll:              oneIn,
+		held:              map[string]map[chan storage.Removal]struct{}{},
 		registrationCount: registrationCount,
 		removalCount:      removalCount,
 		methodsDiscovered: methodsDiscovered,

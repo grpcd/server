@@ -172,11 +172,26 @@ func (r *Store) Ping(ctx context.Context) error {
 }
 
 // observe passes err through, recording the store as lost when it says Redis
-// could not be reached. A missing key is an answer, and the caller's own
-// context ending says nothing about Redis, so neither counts.
+// could not be reached, and as back when an operation succeeds against a
+// store recorded lost. A missing key is an answer, and the caller's own
+// context ending says nothing about Redis, so neither counts either way.
+//
+// The recovery matters for a Redis that stopped answering without closing
+// its connections and then resumed: the subscription never reconnected, so
+// nothing else says it is back.
 func (r *Store) observe(ctx context.Context, err error) error {
-	if err != nil && !isNil(err) && ctx.Err() == nil {
+	if ctx.Err() != nil {
+		return err
+	}
+
+	if err != nil && !isNil(err) {
 		r.conditions.Lose()
+
+		return err
+	}
+
+	if r.conditions.Current().Lost {
+		r.conditions.Recover()
 	}
 
 	return err

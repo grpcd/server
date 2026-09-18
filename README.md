@@ -5,17 +5,22 @@ The grpcd server. It answers the three RPCs in
 registrations, and keeps the rows in a storage backend shared by every instance
 in a region.
 
+It is a [connect-service](https://github.com/pbrpc/connect-service) server: one
+port serves gRPC, gRPC-Web, and Connect, and `GET /healthz` answers plain HTTP
+probes. A registration lasts as long as the stream holding it. The server ends
+no stream of its own accord, so a service stays registered until it leaves or
+its connection breaks.
+
 Container images are published to `ghcr.io/grpcd/server`.
 
 ## Quick Start
 
 ```bash
 # In-memory storage (development)
-docker run -p 5000:5000 ghcr.io/grpcd/server:latest
+docker run -p 50051:50051 ghcr.io/grpcd/server:latest
 
 # Redis (production)
-docker run -p 5000:5000 \
-  -e GRPC_MAX_CONNECTION_AGE=0 \
+docker run -p 50051:50051 \
   -e STORAGE_BACKEND=redis \
   -e STORAGE_ADDRESS=redis:6379 \
   ghcr.io/grpcd/server:latest
@@ -25,29 +30,32 @@ docker run -p 5000:5000 \
 
 Everything is an environment variable.
 
-| Variable                  | Description                                              | Default |
-| ------------------------- | -------------------------------------------------------- | ------- |
-| `GRPC_SERVER_ADDRESS`     | Address to bind                                          | `:5000` |
-| `GRPC_MAX_CONNECTION_AGE` | Age at which the server sends a GOAWAY. `0` is no limit. | `10m`   |
-| `STORAGE_BACKEND`         | `redis`, or empty for in-memory                          | -       |
-| `STORAGE_ADDRESS`         | Storage backend address. Required for `redis`.           | -       |
+| Variable              | Description                                                            | Default  |
+| --------------------- | ---------------------------------------------------------------------- | -------- |
+| `SERVICE_ADDRESS`     | Address to bind                                                        | `:50051` |
+| `TLS_CERT`, `TLS_KEY` | The listener's certificate and key as PEM. Unset is cleartext.         | -        |
+| `TLS_CLIENT_CA`       | A PEM CA. When set, every client must present a certificate it signed. | -        |
+| `STORAGE_BACKEND`     | `redis`, or empty for in-memory                                        | -        |
+| `STORAGE_ADDRESS`     | Storage backend address. Required for `redis`.                         | -        |
 
-Set `GRPC_MAX_CONNECTION_AGE=0`. A registration lives as long as the stream
-holding it, and a GOAWAY ends that stream whether or not it is active. At the
-ten minute default, every registration in the mesh is torn down and rebuilt on
-that timer. It works, and it looks healthy, while costing a reconnect per
-service per interval. The server reports the value in effect at startup.
+Each `TLS_*` variable holds the material itself, not a path to it.
+`SERVICE_NAME`, `SERVICE_VERSION`, `MAX_CONNECTION_IDLE`,
+`HTTP_SERVER_IDLE_TIMEOUT`, `HTTP2_SEND_PING_TIMEOUT`, `HTTP2_PING_TIMEOUT`,
+`OTEL_*`, and `LOG_FORMAT` are read as on every service across the
+[`pbrpc` ecosystem](https://github.com/pbrpc).
 
 ### Health
 
-The health service answers for two entries. `""` says the process is alive.
-`grpcd.GRPCDService` says whether the store can be reached: it reports
-`NOT_SERVING` from the first operation that fails against the store until the
-store's subscription comes back, and `SERVING` otherwise.
+`GET /healthz` answers for the process: `200` with `{"status":"SERVING"}` while
+it is up. `GET /healthz?service=grpcd.GRPCDService` answers for the service,
+which is whether the store can be reached: `503` with `{"status":"NOT_SERVING"}`
+from the moment the store's subscription breaks, or an operation fails against
+the store, until the subscription is back or an operation succeeds, and `200`
+with `SERVING` otherwise.
 
 A balancer or orchestrator probe that should route around an instance that has
-lost its store asks for `grpcd.GRPCDService`. A probe that asks for `""` sees
-only whether the process is up.
+lost its store asks for `grpcd.GRPCDService`. A probe that asks for the process
+sees only whether it is up.
 
 ## Design
 
@@ -105,17 +113,20 @@ process, so it needs no coordination and no durability.
 
 ### Registration
 
-`internal/service/register.go`. The handler validates the request, reads the
-IP off the peer, composes the address, writes one row per method plus the
-anchor, sends the acknowledgement, and blocks on the stream. When the stream
-ends it removes every row the request named. The handler holds that list for
-the life of the stream, so no reverse mapping is stored.
+`internal/service/register.go`. The handler validates the request, reads the IP
+off the call's peer address, composes the address, writes one row per method
+plus the anchor, sends the acknowledgement, and blocks on the stream. When the
+stream ends it removes every row the request named. The handler holds the
+request for the life of the stream, and writes the registration again from it
+whenever the rows may be gone; no copy of what any stream registered is kept
+anywhere else. The instance keeps only which handlers hold a stream at which
+address, to hand a removal to.
 
 ### Discovery
 
 `internal/service/discover.go`. `AddressesFor` on the store is a sequence, and
-each pull is one uniform random draw over the set as it is at that moment, so
-a lookup costs O(1) per candidate however many addresses the method has and a
+each pull is one uniform random draw over the set as it is at that moment, so a
+lookup costs O(1) per candidate however many addresses the method has and a
 removed address is never drawn again. The sequence ends when the set is empty,
 and the handler then waits for the next addition announced for the method.
 
@@ -129,9 +140,9 @@ store's set is the truth throughout.
 
 ### Notifications
 
-Every registration is announced once per instance, over one subscription to
-the storage backend, and every handler waiting on that instance is woken by
-that one announcement. Each woken handler reads the store to learn whether the
+Every registration is announced once per instance, over one subscription to the
+storage backend, and every handler waiting on that instance is woken by that one
+announcement. Each woken handler reads the store to learn whether the
 registration concerned it. No instance holds a list of who is waiting for what.
 
 Instances also notify each other about removals, over the backend's
@@ -139,25 +150,45 @@ publish/subscribe, addressed to a single anchor.
 
 ### Reverting a wrong removal
 
-The instance anchoring an address is notified when that row is removed and
-writes it back. Its open `Register` stream is live proof the service is up, so
-it performs no check of its own. `grpcd.removals.reverted.total` counts these,
-so a client with a persistent local fault surfaces in monitoring.
+The instance anchoring an address is notified when a row for it is removed, and
+hands the removal to the `Register` handler holding a stream at that address.
+The handler writes its registration again from the request it holds: its open
+stream is live proof the service is up, so it performs no check of its own. It
+writes what the request names and nothing else, so a row left on the address by
+an earlier occupant, one a container gave up and another took, stays removed. A
+removal at an address no stream holds any more is a stream that ended in the
+meantime, and it stands. `grpcd.removals.reverted.total` counts the
+registrations written again, so a client with a persistent local fault surfaces
+in monitoring.
 
 ### Losing the storage backend
 
 `internal/service/outage.go`. An instance that cannot reach the backend can
 neither record a registration nor answer a lookup, and is deaf to additions. It
 keeps serving and reports `grpcd.GRPCDService` as `NOT_SERVING` until the
-backend's subscription comes back.
+backend is back.
+
+The loss is noticed two ways. The additions subscription is the one connection
+to the backend that is always open, so a backend that dies is seen the moment
+its socket closes, with nothing touching the store; a backend that vanishes
+without closing it is seen when TCP keepalive gives up on the connection. An
+operation that fails against the backend says the same thing, which is how a
+backend that hangs without dropping its connections is found. The subscription
+reconnects on a backoff schedule, resolving the address again each time, so a
+backend brought back elsewhere under the same name is found; its resubscription
+is the backend being back, as is any operation that succeeds against a store
+recorded lost.
 
 The streams it holds are kept. A handler that fails against the backend waits
 for it to return and carries on: a registration is written once it can be, a
 lookup draws again, a watch resumes. A client already on the instance sees a
-call take longer and nothing else.
+call take longer and nothing else. A stream that ends during the outage has its
+rows removed once, which fails, and they stay until a client fails against the
+address and reports it; a removal applied later than the stream ended could
+take rows a new occupant of the address has since written.
 
-When the backend returns, every held registration writes its rows again from
-the request the handler still holds, so a backend that came back empty is
+When the backend returns, every held registration writes its rows again from the
+request the handler still holds, so a backend that came back empty is
 repopulated by the instances themselves. Waiting lookups draw again, since the
 backend may hold registrations the instance was deaf to.
 
@@ -170,14 +201,14 @@ rediscover.
 **Instance crash.** Its rows remain, because removal happens when an instance
 observes a stream ending and this one is gone; live services stay discoverable
 throughout. Its registration streams break, and each service reconnects to
-another instance and re-registers: the same rows, written again, with the
-anchor overwritten by the new instance's id. Until that lands, those rows carry
-the id of a channel nobody reads, so a wrong `dead_address` report in that
-window drops a live service until it re-registers.
+another instance and re-registers: the same rows, written again, with the anchor
+overwritten by the new instance's id. Until that lands, those rows carry the id
+of a channel nobody reads, so a wrong `dead_address` report in that window drops
+a live service until it re-registers.
 
-**Service and its anchoring instance crash together.** Nothing runs the
-removal, so the row remains. The first client to discover that address fails
-against it and reports it, which removes it.
+**Service and its anchoring instance crash together.** Nothing runs the removal,
+so the row remains. The first client to discover that address fails against it
+and reports it, which removes it.
 
 **Storage backend failure.** Covered under Design. Services and clients continue
 on the connections they already hold.
@@ -193,8 +224,7 @@ share it.
 
 **Redis** (`internal/storage/redis/`). The production backend. Sets hold the
 method rows, and publish/subscribe carries the addition announcements and the
-removal notifications. Instances share state, and Sentinel or Cluster supply
-HA.
+removal notifications. Instances share state, and Sentinel or Cluster supply HA.
 
 ## Observability
 
@@ -207,14 +237,22 @@ Counters, exported over OpenTelemetry:
 - `grpcd.rebalances.total`
 
 The info and diagnostics services from
-[grpc-service](https://github.com/sonic-original-software/grpc-service) report
-the version and the store's connectivity.
+[connect-service](https://github.com/pbrpc/connect-service) report the version
+and the store under the `storage` dependency: `REACHABLE` when it answers a
+ping, `UNREACHABLE` with the failure under the `error` detail otherwise.
 
 ## Development
 
 ```bash
-go test ./...
-go test -fuzz=FuzzRegister ./internal/service
-go test -fuzz=FuzzDiscover ./internal/service
+go vet ./...
+go test -race -cover ./...
+go test -fuzz=FuzzRegister_MethodNames ./internal/service
+go test -fuzz=FuzzRegister_MethodCounts ./internal/service
+go test -fuzz=FuzzDiscover_MethodNames ./internal/service
 CGO_ENABLED=0 go build -ldflags="-w -s" -o grpcd .
 ```
+
+The service tests drive the handlers through the generated client over the
+in-process transport, so nothing listens. The transport hands messages over
+unbuffered: a handler's `Send` returns once the test has received the message,
+and its `Receive` once the test has sent or closed.

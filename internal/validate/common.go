@@ -4,7 +4,7 @@ package validate
 import (
 	"strings"
 
-	"git.sonicoriginal.software/grpc-foundation/errors"
+	errors "github.com/pbrpc/connect-errors"
 )
 
 // validateSingleMethod performs the core validation logic for a single method name

@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"git.sonicoriginal.software/grpc-testing/mocks/meter"
+	"github.com/pbrpc/otel-testing/mocks/meter"
 
 	"github.com/grpcd/server/internal/storage/mock"
 )

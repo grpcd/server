@@ -3,15 +3,18 @@ package service
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 
-	"google.golang.org/grpc/peer"
+	"connectrpc.com/connect/v2"
 
 	"git.sonicoriginal.software/logger"
 
-	"git.sonicoriginal.software/grpc-foundation/errors"
 	grpcd "github.com/grpcd/protos"
+	"github.com/grpcd/protos/grpcdconnect"
+	errors "github.com/pbrpc/connect-errors"
 
 	"github.com/grpcd/server/internal"
 	"github.com/grpcd/server/internal/storage"
@@ -42,9 +45,8 @@ func validateRegisterRequest(req *grpcd.RegisterRequest) []errors.FieldViolation
 // handler removes them on its way out. A caller that crashes ends the stream
 // the same way a caller that exits cleanly does, so both are the same path.
 func (s *GRPCDServer) Register(
-	req *grpcd.RegisterRequest, stream grpcd.GRPCDService_RegisterServer,
+	ctx context.Context, req *grpcd.RegisterRequest, stream grpcdconnect.GRPCDServiceRegisterServerStream,
 ) error {
-	ctx := stream.Context()
 	log := logger.FromContext(ctx).With("server_name", req.ServerName)
 
 	violations := validateRegisterRequest(req)
@@ -63,6 +65,12 @@ func (s *GRPCDServer) Register(
 
 	log.InfoContext(ctx, "Registering service instance")
 	log.DebugContext(ctx, "Registering methods", "methods", req.Methods)
+
+	// Held before the rows exist, so a removal of any of them reaches this
+	// handler; let go after they are released, so one arriving in between is
+	// dropped with the stream that would have answered it.
+	removals := s.hold(address)
+	defer s.unhold(address, removals)
 
 	condition, err := s.write(ctx, log, address, req.Methods)
 	if err != nil {
@@ -83,9 +91,12 @@ func (s *GRPCDServer) Register(
 	log.InfoContext(ctx, "Successfully registered service instance")
 
 	// Holding the stream is the registration. Returning ends it, so this waits
-	// for the caller to go away. The store coming back in the meantime means
-	// it may have come back empty, and the rows are written again from the
-	// request this handler still holds.
+	// for the caller to go away. The rows are written again from the request
+	// this handler still holds whenever they may be gone: the store coming
+	// back may have come back empty, and a client that could not reach the
+	// address has had it removed. The open stream is proof the service is up,
+	// so the registration is made again as it was; a row the request never
+	// named, left by an earlier occupant of the address, is not among it.
 	for {
 		select {
 		case <-ctx.Done():
@@ -93,20 +104,74 @@ func (s *GRPCDServer) Register(
 
 			return nil
 		case <-condition.Changed:
+			if condition = s.store.Condition(); condition.Lost {
+				continue
+			}
+
+			s.rewrite(ctx, log, address, req.Methods, "Rewrote methods after the store came back")
+		case removal := <-removals:
+			if s.rewrite(ctx, log.With("method_name", removal.Method), address, req.Methods,
+				"Registered again after a removal") && s.revertedRemovals != nil {
+				s.revertedRemovals.Add(ctx, 1)
+			}
 		}
-
-		if condition = s.store.Condition(); condition.Lost {
-			continue
-		}
-
-		if err := s.store.Add(ctx, address, s.anchor, req.Methods); err != nil {
-			log.ErrorContext(ctx, "Failed to rewrite methods after the store came back", "error", err)
-
-			continue
-		}
-
-		log.InfoContext(ctx, "Rewrote methods after the store came back")
 	}
+}
+
+// rewrite writes the registration again, reporting whether it landed. A
+// failure is logged and nothing more: a lost store is written again when it
+// comes back, and any other failure is the store's to have reported.
+func (s *GRPCDServer) rewrite(
+	ctx context.Context, log *slog.Logger, address string, methods []string, message string,
+) bool {
+	if err := s.store.Add(ctx, address, s.anchor, methods); err != nil {
+		log.ErrorContext(ctx, "Failed to write the registration again", "error", err)
+
+		return false
+	}
+
+	log.InfoContext(ctx, message)
+
+	return true
+}
+
+// hold records the handler holding a stream at address and answers with the
+// channel a removal at that address is handed on. One pending removal is
+// enough: the registration is written whole either way.
+func (s *GRPCDServer) hold(address string) chan storage.Removal {
+	removals := make(chan storage.Removal, 1)
+
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+
+	if s.held[address] == nil {
+		s.held[address] = map[chan storage.Removal]struct{}{}
+	}
+
+	s.held[address][removals] = struct{}{}
+
+	return removals
+}
+
+// unhold forgets the handler that held removals at address.
+func (s *GRPCDServer) unhold(address string, removals chan storage.Removal) {
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+
+	delete(s.held[address], removals)
+
+	if len(s.held[address]) == 0 {
+		delete(s.held, address)
+	}
+}
+
+// holders answers with the channels of the handlers holding a stream at
+// address.
+func (s *GRPCDServer) holders(address string) []chan storage.Removal {
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+
+	return slices.Collect(maps.Keys(s.held[address]))
 }
 
 // write records the rows, waiting out a lost store rather than failing on it.
@@ -166,15 +231,16 @@ func (s *GRPCDServer) release(
 	log.InfoContext(ctx, "Removed service instance")
 }
 
-// address composes the caller's address from the IP on the connection and the
-// port the caller reported.
+// address composes the caller's address from the IP of the peer the transport
+// recorded for the call and the port the caller reported.
 //
 // Neither half is available on its own: a containerized service does not know
 // its reachable IP, and the port on the peer socket is the ephemeral one the
-// caller dialed from.
+// caller dialed from. A call carrying no peer is one the transport has no
+// network address for, and there is nothing to register it under.
 func (s *GRPCDServer) address(ctx context.Context, port uint32) (string, error) {
-	info, ok := peer.FromContext(ctx)
-	if !ok {
+	peerAddr := peerAddress(ctx)
+	if peerAddr == "" {
 		return "", errors.Internal(
 			ctx,
 			"failed to extract connection info",
@@ -183,10 +249,20 @@ func (s *GRPCDServer) address(ctx context.Context, port uint32) (string, error) 
 		)
 	}
 
-	host, _, err := net.SplitHostPort(info.Addr.String())
+	host, _, err := net.SplitHostPort(peerAddr)
 	if err != nil {
-		host = info.Addr.String()
+		host = peerAddr
 	}
 
 	return net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10)), nil
+}
+
+// peerAddress answers with the address the transport recorded as the call's
+// peer, empty when it recorded none.
+func peerAddress(ctx context.Context) string {
+	if info, ok := connect.CallInfoForServerContext(ctx); ok {
+		return info.PeerAddr
+	}
+
+	return ""
 }

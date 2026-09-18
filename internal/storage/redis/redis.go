@@ -2,27 +2,38 @@
 package redis
 
 import (
+	"context"
+	"iter"
+
+	"github.com/cenkalti/backoff/v7"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/grpcd/server/internal/storage"
 )
+
+// BackOffFactory makes the schedule the subscription's reconnection attempts
+// follow while the backend cannot be reached.
+type BackOffFactory func() backoff.BackOff
 
 // Store implements Store using Redis as the backend
 type Store struct {
 	client     *redis.Client
 	additions  *storage.Additions
 	conditions *storage.Conditions
+	newBackOff BackOffFactory
 }
 
-// NewRedisStore creates a new Redis store
-// Performs pure construction with no network I/O
-func NewRedisStore(addr string) *Store {
+// NewRedisStore creates a new Redis store, reconnecting its subscription on
+// the schedule newBackOff makes. Performs pure construction with no network
+// I/O.
+func NewRedisStore(addr string, newBackOff BackOffFactory) *Store {
 	client := redis.NewClient(&redis.Options{Addr: addr})
 
 	return &Store{
 		client:     client,
 		additions:  storage.NewAdditions(),
 		conditions: storage.NewConditions(),
+		newBackOff: newBackOff,
 	}
 }
 
@@ -34,6 +45,11 @@ func (r *Store) Latest() *storage.Addition {
 // Condition answers with the store's reachability.
 func (r *Store) Condition() *storage.Condition {
 	return r.conditions.Current()
+}
+
+// Changes yields the store's reachability as it changes.
+func (r *Store) Changes(ctx context.Context) iter.Seq[*storage.Condition] {
+	return r.conditions.Changes(ctx)
 }
 
 // Close closes the Redis connection

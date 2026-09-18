@@ -2,33 +2,297 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/peer"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connectinprocess"
 
-	"git.sonicoriginal.software/grpc-testing/mocks/addr"
-	"git.sonicoriginal.software/grpc-testing/mocks/meter"
+	"git.sonicoriginal.software/logger"
+
 	grpcd "github.com/grpcd/protos"
+	"github.com/grpcd/protos/grpcdconnect"
+	"github.com/pbrpc/otel-testing/mocks/meter"
 
 	"github.com/grpcd/server/internal/storage/mock"
 )
 
 const testAnchor = "anchor-under-test"
 
-// discovering runs Discover on its own goroutine and answers with a channel
-// carrying its return value, because a handler that runs out of candidates
-// blocks until a registration arrives or the caller leaves.
-func discovering(server *GRPCDServer, stream *discoverStream) <-chan error {
-	returned := make(chan error, 1)
+// newServer builds a server on a fresh mock store, which the caller keeps to
+// assert on.
+func newServer() (*GRPCDServer, *mock.Store) {
+	store := mock.NewStore()
 
-	go func() { returned <- server.Discover(stream) }()
+	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, meter.New(), testAnchor), store
+}
 
-	return returned
+// harness serves a GRPCDServer in-process: plain function calls through the
+// generated handler and client, no listener, no network. Messages are handed
+// over unbuffered, so a handler's Send returns only once the test has
+// received it, and a handler's Receive only once the test has sent or closed.
+//
+// It also reports each handler's return to a test that asked for it. The
+// transport hands that verdict to the client's Receive, which after the caller
+// leaves may answer with the cancellation before the handler has returned, so
+// a test that acts on the handler having finished waits here instead.
+type harness struct {
+	server *GRPCDServer
+	store  *mock.Store
+
+	// Signals a test registers to be handed the next return of each handler.
+	mu         sync.Mutex
+	registered chan error
+	discovered chan error
+	watched    chan error
+}
+
+func newHarness() *harness {
+	server, store := newServer()
+
+	return &harness{server: server, store: store}
+}
+
+// client answers with a generated client whose calls reach the server
+// in-process, each carrying peer as the connection's address. The in-process
+// transport has no network peer of its own, so an empty peer is a call that
+// arrives with none.
+func (h *harness) client(peer string) grpcdconnect.GRPCDServiceClient {
+	interceptors := []connect.ServerInterceptor{loggerInterceptor(h.server.log)}
+
+	if peer != "" {
+		interceptors = append(interceptors, peerInterceptor(peer))
+	}
+
+	rpc := connect.NewServer(interceptors...)
+	grpcdconnect.RegisterGRPCDServiceHandler(rpc, h)
+
+	return grpcdconnect.NewGRPCDServiceClient(connect.NewClient(connectinprocess.New(rpc)))
+}
+
+// loggerInterceptor puts log in every call's context, the way the foundation's
+// server does, so the handlers log where the server under test does.
+func loggerInterceptor(log *slog.Logger) connect.ServerInterceptor {
+	return func(next connect.ServerFunc) connect.ServerFunc {
+		return func(ctx context.Context, spec connect.Spec, stream connect.ServerStream) error {
+			return next(logger.ContextWithLogger(ctx, log), spec, stream)
+		}
+	}
+}
+
+// peerInterceptor records address as the peer of every call, the way the HTTP
+// transport records the socket's remote address.
+func peerInterceptor(address string) connect.ServerInterceptor {
+	return func(next connect.ServerFunc) connect.ServerFunc {
+		return func(ctx context.Context, spec connect.Spec, stream connect.ServerStream) error {
+			if info, ok := connect.CallInfoForServerContext(ctx); ok {
+				info.PeerAddr = address
+			}
+
+			return next(ctx, spec, stream)
+		}
+	}
+}
+
+func (h *harness) Register(
+	ctx context.Context, req *grpcd.RegisterRequest, stream grpcdconnect.GRPCDServiceRegisterServerStream,
+) error {
+	err := h.server.Register(ctx, req, stream)
+	h.report(&h.registered, err)
+
+	return err
+}
+
+func (h *harness) Discover(ctx context.Context, stream grpcdconnect.GRPCDServiceDiscoverServerStream) error {
+	err := h.server.Discover(ctx, stream)
+	h.report(&h.discovered, err)
+
+	return err
+}
+
+func (h *harness) Watch(
+	ctx context.Context, req *grpcd.WatchRequest, stream grpcdconnect.GRPCDServiceWatchServerStream,
+) error {
+	err := h.server.Watch(ctx, req, stream)
+	h.report(&h.watched, err)
+
+	return err
+}
+
+// registering answers with a channel carrying the next Register handler's
+// return. A test asks before the handler can return; a return nobody asked
+// for is dropped.
+func (h *harness) registering() <-chan error { return h.expect(&h.registered) }
+
+// discovering answers with a channel carrying the next Discover handler's
+// return.
+func (h *harness) discovering() <-chan error { return h.expect(&h.discovered) }
+
+// watching answers with a channel carrying the next Watch handler's return.
+func (h *harness) watching() <-chan error { return h.expect(&h.watched) }
+
+// expect hands out a fresh signal for slot.
+func (h *harness) expect(slot *chan error) <-chan error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	signal := make(chan error, 1)
+	*slot = signal
+
+	return signal
+}
+
+// report hands err to the signal in slot, if one is registered. The signal is
+// buffered, so the handler's goroutine never waits on the test.
+func (h *harness) report(slot *chan error, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if *slot != nil {
+		*slot <- err
+		*slot = nil
+	}
+}
+
+// await blocks until signal fires and answers with what it carried, failing
+// the test if the test's own context ends first.
+func await[T any](t *testing.T, signal <-chan T, message string) T {
+	t.Helper()
+
+	select {
+	case value := <-signal:
+		return value
+	case <-t.Context().Done():
+		t.Fatal(message)
+	}
+
+	var zero T
+
+	return zero
+}
+
+// assertCode fails the test unless err carries want.
+func assertCode(t *testing.T, err error, want connect.Code) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatalf("expected %v, got no error", want)
+	}
+
+	if got := connect.CodeOf(err); got != want {
+		t.Errorf("expected %v, got %v", want, got)
+	}
+}
+
+// registration is a request registering methods on port 50054.
+func registration(methods ...string) *grpcd.RegisterRequest {
+	return &grpcd.RegisterRequest{Methods: methods, Port: 50054}
+}
+
+// register opens a registration for req over client and waits for grpcd's
+// answer to it: nil once it is acknowledged, otherwise the refusal. An
+// acknowledged stream is held until ctx ends.
+func register(
+	ctx context.Context, client grpcdconnect.GRPCDServiceClient, req *grpcd.RegisterRequest,
+) (grpcdconnect.GRPCDServiceRegisterClientStream, error) {
+	stream, err := client.Register(ctx, req)
+	if err != nil {
+		return stream, err
+	}
+
+	_, err = stream.Receive()
+
+	return stream, err
+}
+
+// asking is the message opening a discovery for method.
+func asking(method string) *grpcd.DiscoverRequest {
+	return &grpcd.DiscoverRequest{Step: &grpcd.DiscoverRequest_MethodName{MethodName: method}}
+}
+
+// askingWithoutWaiting is the message opening a discovery for method by a
+// caller that declines to wait for one that nothing serves.
+func askingWithoutWaiting(method string) *grpcd.DiscoverRequest {
+	request := asking(method)
+	request.NoWait = true
+
+	return request
+}
+
+// reporting is the message reporting address as unreachable.
+func reporting(address string) *grpcd.DiscoverRequest {
+	return &grpcd.DiscoverRequest{Step: &grpcd.DiscoverRequest_DeadAddress{DeadAddress: address}}
+}
+
+// discover asks for method over client and answers with the candidates
+// offered, reporting each of dead as unreachable in turn and closing the
+// stream once they are spent, which is how a caller says the last candidate
+// worked. The error is how grpcd ended the stream instead: nil when it let
+// the caller close it.
+func discover(
+	ctx context.Context, client grpcdconnect.GRPCDServiceClient, method string, dead ...string,
+) ([]string, error) {
+	return ask(ctx, client, asking(method), dead...)
+}
+
+// discoverWithoutWaiting is discover for a caller that declines to wait.
+func discoverWithoutWaiting(
+	ctx context.Context, client grpcdconnect.GRPCDServiceClient, method string, dead ...string,
+) ([]string, error) {
+	return ask(ctx, client, askingWithoutWaiting(method), dead...)
+}
+
+// ask drives one Discover stream: request first, then a verdict on each
+// candidate as it comes, dead reported in order and the stream closed once
+// they are spent.
+func ask(
+	ctx context.Context,
+	client grpcdconnect.GRPCDServiceClient,
+	request *grpcd.DiscoverRequest,
+	dead ...string,
+) ([]string, error) {
+	stream, err := client.Discover(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	if err := stream.Send(request); err != nil {
+		return nil, err
+	}
+
+	var candidates []string
+
+	for {
+		candidate, err := stream.Receive()
+		if errors.Is(err, io.EOF) {
+			return candidates, nil
+		}
+
+		if err != nil {
+			return candidates, err
+		}
+
+		candidates = append(candidates, candidate.GetAddress())
+
+		if len(dead) == 0 {
+			if err := stream.CloseSend(); err != nil {
+				return candidates, err
+			}
+
+			continue
+		}
+
+		if err := stream.Send(reporting(dead[0])); err != nil {
+			return candidates, err
+		}
+
+		dead = dead[1:]
+	}
 }
 
 // seedTwo registers two addresses for method, so a test that reports one dead
@@ -79,158 +343,4 @@ func isValidMethodName(name string) bool {
 	}
 
 	return true
-}
-
-// newServer builds a server on a fresh mock store, which the caller keeps to
-// assert on.
-func newServer() (*GRPCDServer, *mock.Store) {
-	store := mock.NewStore()
-
-	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, meter.New(), testAnchor), store
-}
-
-// peerContext puts a connection address on ctx the way gRPC does, so the
-// handler composes the same address a real caller would produce.
-func peerContext(ctx context.Context, address string) context.Context {
-	return peer.NewContext(ctx, &peer.Peer{Addr: addr.New(address)})
-}
-
-// registerStream stands in for a held registration stream. Cancelling the
-// context it carries is what a caller going away looks like to the handler.
-type registerStream struct {
-	grpc.ServerStream
-
-	ctx context.Context
-
-	mu       sync.Mutex
-	sent     []*grpcd.RegisterResponse
-	sendErr  error
-	received chan struct{}
-}
-
-func newRegisterStream(ctx context.Context) *registerStream {
-	return &registerStream{ctx: ctx, received: make(chan struct{}, 1)}
-}
-
-func (s *registerStream) Context() context.Context { return s.ctx }
-
-func (s *registerStream) Send(response *grpcd.RegisterResponse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.sendErr != nil {
-		return s.sendErr
-	}
-
-	s.sent = append(s.sent, response)
-
-	select {
-	case s.received <- struct{}{}:
-	default:
-	}
-
-	return nil
-}
-
-// acknowledged blocks until the handler has confirmed the registration, so a
-// test acts on a stream that is actually being held.
-func (s *registerStream) acknowledged() <-chan struct{} { return s.received }
-
-func (s *registerStream) sends() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return len(s.sent)
-}
-
-// discoverStream stands in for a client discovering a method. requests are
-// replayed in order, and responses records the candidates the handler offered.
-type discoverStream struct {
-	grpc.ServerStream
-
-	ctx context.Context
-
-	requests []recvResult
-	received int
-
-	mu        sync.Mutex
-	responses []string
-	sendErr   error
-}
-
-// recvResult is one message the fake client sends, or the error ending it.
-type recvResult struct {
-	request *grpcd.DiscoverRequest
-	err     error
-}
-
-// asks builds a stream that requests method and then reports each of dead as
-// unreachable, ending once they are exhausted.
-func asks(ctx context.Context, method string, dead ...string) *discoverStream {
-	requests := []recvResult{{
-		request: &grpcd.DiscoverRequest{
-			Step: &grpcd.DiscoverRequest_MethodName{MethodName: method},
-		},
-	}}
-
-	for _, address := range dead {
-		requests = append(requests, recvResult{
-			request: &grpcd.DiscoverRequest{
-				Step: &grpcd.DiscoverRequest_DeadAddress{DeadAddress: address},
-			},
-		})
-	}
-
-	return &discoverStream{ctx: ctx, requests: requests}
-}
-
-// satisfiedAfter builds a stream that requests method, reports each of dead,
-// and then closes — which is how a caller says the last candidate worked.
-func satisfiedAfter(ctx context.Context, method string, dead ...string) *discoverStream {
-	stream := asks(ctx, method, dead...)
-	stream.requests = append(stream.requests, recvResult{err: io.EOF})
-
-	return stream
-}
-
-// asksWithoutWaiting builds a stream that requests method with no_wait set
-// and then reports each of dead as unreachable.
-func asksWithoutWaiting(ctx context.Context, method string, dead ...string) *discoverStream {
-	stream := asks(ctx, method, dead...)
-	stream.requests[0].request.NoWait = true
-
-	return stream
-}
-
-func (s *discoverStream) Context() context.Context { return s.ctx }
-
-func (s *discoverStream) Recv() (*grpcd.DiscoverRequest, error) {
-	if s.received >= len(s.requests) {
-		return nil, io.EOF
-	}
-
-	result := s.requests[s.received]
-	s.received++
-
-	return result.request, result.err
-}
-
-func (s *discoverStream) Send(response *grpcd.DiscoverResponse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.sendErr != nil {
-		return s.sendErr
-	}
-
-	s.responses = append(s.responses, response.Address)
-
-	return nil
-}
-
-func (s *discoverStream) candidates() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return append([]string(nil), s.responses...)
 }
