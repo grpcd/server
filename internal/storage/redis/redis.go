@@ -3,6 +3,7 @@ package redis
 
 import (
 	"context"
+	"fmt"
 	"iter"
 
 	"github.com/cenkalti/backoff/v7"
@@ -23,18 +24,23 @@ type Store struct {
 	newBackOff BackOffFactory
 }
 
-// NewRedisStore creates a new Redis store, reconnecting its subscription on
-// the schedule newBackOff makes. Performs pure construction with no network
-// I/O.
-func NewRedisStore(addr string, newBackOff BackOffFactory) *Store {
-	client := redis.NewClient(&redis.Options{Addr: addr})
+// NewRedisStore creates a Redis store at the configured address, reconnecting
+// its subscription on the schedule newBackOff makes. Redis is reached at an
+// address, so a configuration without one is refused. Performs pure
+// construction with no network I/O.
+func NewRedisStore(cfg storage.Configuration, newBackOff BackOffFactory) (*Store, error) {
+	if cfg.Address == "" {
+		return nil, fmt.Errorf("%w: STORAGE_ADDRESS is required for redis", storage.ErrStorageNotConfigured)
+	}
+
+	client := redis.NewClient(&redis.Options{Addr: cfg.Address})
 
 	return &Store{
 		client:     client,
 		additions:  storage.NewAdditions(),
 		conditions: storage.NewConditions(),
 		newBackOff: newBackOff,
-	}
+	}, nil
 }
 
 // Latest answers with the most recent addition announced to this instance.

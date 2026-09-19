@@ -215,8 +215,13 @@ on the connections they already hold.
 
 ## Storage Backends
 
-`internal/storage/store.go` is the interface. Adding a backend means
-implementing it and adding a case to `internal/storage/resolver/resolve.go`.
+`internal/storage/store.go` is the interface, and `internal/storage/config.go`
+the one configuration every backend is built from: which backend, and where it
+is reached. A backend's constructor takes that configuration and refuses what
+it cannot use, an empty address for one that reaches a process; the resolver in
+`internal/storage/resolver/` parses it from the environment and switches on
+the backend. Adding a backend means implementing the interface, naming it in
+`Backend`, and adding a case to the resolver.
 
 **In-memory** (`internal/storage/mock/`). Selected when `STORAGE_BACKEND` is
 unset. No external dependency; state is lost on restart, and instances do not

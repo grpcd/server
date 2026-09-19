@@ -7,17 +7,6 @@ import (
 	"iter"
 )
 
-const (
-	// EnvStorageBackend is the environment variable key for storage backend type
-	EnvStorageBackend = "STORAGE_BACKEND"
-
-	// EnvStorageAddress is the environment variable key for storage backend address
-	EnvStorageAddress = "STORAGE_ADDRESS"
-
-	// ErrCodeStorageNotConfigured is the code for storage that is not configured
-	ErrCodeStorageNotConfigured = "STORAGE_NOT_CONFIGURED"
-)
-
 var (
 	// ErrMethodNotFound is returned when a method has no registered addresses
 	ErrMethodNotFound = errors.New("method not found")
