@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.7.0 - 2026-09-19
+#### Features
+- pick up config from env - (ddbdf22) - Nathan Blair
+#### Miscellaneous Chores
+- further implementation work - (7dc0f97) - Nathan Blair
+
+- - -
+
 ## 0.6.1 - 2026-09-16
 #### Bug Fixes
 - respect no_wait - (a449f74) - Nathan Blair
