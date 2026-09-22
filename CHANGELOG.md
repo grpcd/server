@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.9.0 - 2026-09-22
+#### Features
+- remove held loggers - (cc3d260) - Nathan Blair
+#### Documentation
+- fix stale variable name - (c5e8a68) - Nathan Blair
+
+- - -
+
 ## 0.8.0 - 2026-09-22
 #### Features
 - use spans for metrics - (e6b3301) - Nathan Blair
