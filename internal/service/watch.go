@@ -3,6 +3,9 @@ package service
 import (
 	"context"
 
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"git.sonicoriginal.software/logger"
 
 	grpcd "github.com/grpcd/protos"
@@ -42,10 +45,14 @@ func validateWatchRequest(req *grpcd.WatchRequest) []errors.FieldViolation {
 // client closes it, which it does once it has moved and opened a new Watch
 // naming where it went.
 func (s *GRPCDServer) Watch(
-	ctx context.Context, req *grpcd.WatchRequest, stream grpcdconnect.GRPCDServiceWatchServerStream,
+	ctx context.Context,
+	req *grpcd.WatchRequest,
+	stream grpcdconnect.GRPCDServiceWatchServerStream,
 ) error {
 	log := logger.FromContext(ctx).With(
-		"peer_address", peerAddress(ctx), "method_name", req.MethodName, "held_address", req.Address,
+		"peer_address", peerAddress(ctx),
+		"method_name", req.MethodName,
+		"held_address", req.Address,
 	)
 
 	if violations := validateWatchRequest(req); len(violations) > 0 {
@@ -88,7 +95,8 @@ func (s *GRPCDServer) Watch(
 			if !lost {
 				log.ErrorContext(ctx, "Failed to count addresses", "error", err)
 
-				return errors.Internal(ctx, "failed to watch method", errCodeWatchFailed, internal.ErrDomain)
+				return errors.Internal(ctx, "failed to watch method",
+					errCodeWatchFailed, internal.ErrDomain)
 			}
 
 			if !waited {
@@ -106,14 +114,29 @@ func (s *GRPCDServer) Watch(
 			continue
 		}
 
-		if err := stream.Send(&grpcd.WatchResponse{Address: latest.Address}); err != nil {
+		if err := s.move(ctx, stream, latest.Address); err != nil {
 			return err
-		}
-
-		if s.rebalanceCount != nil {
-			s.rebalanceCount.Add(ctx, 1)
 		}
 
 		log.InfoContext(ctx, "Told to move", "address", latest.Address)
 	}
+}
+
+// move tells the client to move to address, under a span of its own.
+func (s *GRPCDServer) move(
+	ctx context.Context,
+	stream grpcdconnect.GRPCDServiceWatchServerStream,
+	address string,
+) error {
+	ctxSpan := trace.SpanFromContext(ctx)
+	tracer := ctxSpan.TracerProvider().Tracer(tracerName)
+	_, span := tracer.Start(ctx, "move")
+	defer span.End()
+
+	err := stream.Send(&grpcd.WatchResponse{Address: address})
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
+
+	return err
 }

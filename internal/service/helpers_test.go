@@ -5,18 +5,21 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"connectrpc.com/connect/v2"
 	"connectrpc.com/connect/v2/connectinprocess"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"git.sonicoriginal.software/logger"
 
 	grpcd "github.com/grpcd/protos"
 	"github.com/grpcd/protos/grpcdconnect"
-	"github.com/pbrpc/otel-testing/mocks/meter"
+	"github.com/pbrpc/otel-testing/mocks/tracer"
 
 	"github.com/grpcd/server/internal/storage/mock"
 )
@@ -28,7 +31,7 @@ const testAnchor = "anchor-under-test"
 func newServer() (*GRPCDServer, *mock.Store) {
 	store := mock.NewStore()
 
-	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, meter.New(), testAnchor), store
+	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, testAnchor), store
 }
 
 // harness serves a GRPCDServer in-process: plain function calls through the
@@ -44,6 +47,11 @@ type harness struct {
 	server *GRPCDServer
 	store  *mock.Store
 
+	// Every call arrives under a span this records, the way the HTTP layer
+	// starts one per request, so the spans the handlers start under it are
+	// recorded too.
+	tracer *tracer.Mock
+
 	// Signals a test registers to be handed the next return of each handler.
 	mu         sync.Mutex
 	registered chan error
@@ -51,10 +59,39 @@ type harness struct {
 	watched    chan error
 }
 
-func newHarness() *harness {
+func newHarness(t *testing.T) *harness {
+	t.Helper()
+
 	server, store := newServer()
 
-	return &harness{server: server, store: store}
+	recorder, _ := tracer.New(t)
+	t.Cleanup(func() { recorder.Shutdown(t) })
+
+	return &harness{server: server, store: store, tracer: recorder}
+}
+
+// spanStatuses answers with the status of every recorded span named name, in
+// the order they ended.
+func (h *harness) spanStatuses(name string) []codes.Code {
+	var statuses []codes.Code
+
+	for _, span := range h.tracer.GetSpans() {
+		if span.Name == name {
+			statuses = append(statuses, span.Status.Code)
+		}
+	}
+
+	return statuses
+}
+
+// assertSpans fails the test unless the spans named name were recorded with
+// exactly want as their statuses.
+func (h *harness) assertSpans(t *testing.T, name string, want ...codes.Code) {
+	t.Helper()
+
+	if got := h.spanStatuses(name); !slices.Equal(got, want) {
+		t.Errorf("%s spans = %v, want %v", name, got, want)
+	}
 }
 
 // client answers with a generated client whose calls reach the server
@@ -62,7 +99,10 @@ func newHarness() *harness {
 // transport has no network peer of its own, so an empty peer is a call that
 // arrives with none.
 func (h *harness) client(peer string) grpcdconnect.GRPCDServiceClient {
-	interceptors := []connect.ServerInterceptor{loggerInterceptor(h.server.log)}
+	interceptors := []connect.ServerInterceptor{
+		loggerInterceptor(h.server.log),
+		spanInterceptor(h.tracer.Tracer("test")),
+	}
 
 	if peer != "" {
 		interceptors = append(interceptors, peerInterceptor(peer))
@@ -80,6 +120,19 @@ func loggerInterceptor(log *slog.Logger) connect.ServerInterceptor {
 	return func(next connect.ServerFunc) connect.ServerFunc {
 		return func(ctx context.Context, spec connect.Spec, stream connect.ServerStream) error {
 			return next(logger.ContextWithLogger(ctx, log), spec, stream)
+		}
+	}
+}
+
+// spanInterceptor starts a span for every call from tr, the way the HTTP
+// layer starts one per request.
+func spanInterceptor(tr trace.Tracer) connect.ServerInterceptor {
+	return func(next connect.ServerFunc) connect.ServerFunc {
+		return func(ctx context.Context, spec connect.Spec, stream connect.ServerStream) error {
+			ctx, span := tr.Start(ctx, spec.Procedure)
+			defer span.End()
+
+			return next(ctx, spec, stream)
 		}
 	}
 }

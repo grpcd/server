@@ -9,6 +9,8 @@ import (
 	"strconv"
 
 	"connectrpc.com/connect/v2"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"git.sonicoriginal.software/logger"
 
@@ -45,7 +47,9 @@ func validateRegisterRequest(req *grpcd.RegisterRequest) []errors.FieldViolation
 // handler removes them on its way out. A caller that crashes ends the stream
 // the same way a caller that exits cleanly does, so both are the same path.
 func (s *GRPCDServer) Register(
-	ctx context.Context, req *grpcd.RegisterRequest, stream grpcdconnect.GRPCDServiceRegisterServerStream,
+	ctx context.Context,
+	req *grpcd.RegisterRequest,
+	stream grpcdconnect.GRPCDServiceRegisterServerStream,
 ) error {
 	log := logger.FromContext(ctx).With("server_name", req.ServerName)
 
@@ -72,20 +76,9 @@ func (s *GRPCDServer) Register(
 	removals := s.hold(address)
 	defer s.unhold(address, removals)
 
-	condition, err := s.write(ctx, log, address, req.Methods)
+	condition, err := s.register(ctx, log, stream, address, req.Methods)
 	if err != nil {
 		return err
-	}
-
-	if err := stream.Send(&grpcd.RegisterResponse{}); err != nil {
-		log.ErrorContext(ctx, "Failed to acknowledge registration", "error", err)
-		s.release(ctx, log, address, req.Methods)
-
-		return err
-	}
-
-	if s.registrationCount != nil {
-		s.registrationCount.Add(ctx, 1)
 	}
 
 	log.InfoContext(ctx, "Successfully registered service instance")
@@ -108,13 +101,68 @@ func (s *GRPCDServer) Register(
 				continue
 			}
 
-			s.rewrite(ctx, log, address, req.Methods, "Rewrote methods after the store came back")
+			s.rewrite(
+				ctx,
+				log,
+				address,
+				req.Methods,
+				"Rewrote methods after the store came back")
+
 		case removal := <-removals:
-			if s.rewrite(ctx, log.With("method_name", removal.Method), address, req.Methods,
-				"Registered again after a removal") && s.revertedRemovals != nil {
-				s.revertedRemovals.Add(ctx, 1)
-			}
+			s.revert(ctx, log.With("method_name", removal.Method), address, req.Methods)
 		}
+	}
+}
+
+// register writes the rows and acknowledges them, under a span of its own:
+// the registration is the bounded part of the stream, and the hold that
+// follows lasts as long as the caller does. A failure to acknowledge releases
+// what was written, since the caller never learns it registered.
+func (s *GRPCDServer) register(
+	ctx context.Context,
+	log *slog.Logger,
+	stream grpcdconnect.GRPCDServiceRegisterServerStream,
+	address string,
+	methods []string,
+) (*storage.Condition, error) {
+	ctxSpan := trace.SpanFromContext(ctx)
+	tracer := ctxSpan.TracerProvider().Tracer(tracerName)
+	spanCtx, span := tracer.Start(ctx, "register")
+	defer span.End()
+
+	condition, err := s.write(spanCtx, log, address, methods)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+
+		return nil, err
+	}
+
+	if err := stream.Send(&grpcd.RegisterResponse{}); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		log.ErrorContext(spanCtx, "Failed to acknowledge registration", "error", err)
+		s.release(spanCtx, log, address, methods)
+
+		return nil, err
+	}
+
+	return condition, nil
+}
+
+// revert writes the registration again after a removal, under a span that
+// fails when the write did not land.
+func (s *GRPCDServer) revert(
+	ctx context.Context,
+	log *slog.Logger,
+	address string,
+	methods []string,
+) {
+	ctxSpan := trace.SpanFromContext(ctx)
+	tracer := ctxSpan.TracerProvider().Tracer(tracerName)
+	ctx, span := tracer.Start(ctx, "revert")
+	defer span.End()
+
+	if !s.rewrite(ctx, log, address, methods, "Registered again after a removal") {
+		span.SetStatus(codes.Error, "not written")
 	}
 }
 
@@ -122,7 +170,11 @@ func (s *GRPCDServer) Register(
 // failure is logged and nothing more: a lost store is written again when it
 // comes back, and any other failure is the store's to have reported.
 func (s *GRPCDServer) rewrite(
-	ctx context.Context, log *slog.Logger, address string, methods []string, message string,
+	ctx context.Context,
+	log *slog.Logger,
+	address string,
+	methods []string,
+	message string,
 ) bool {
 	if err := s.store.Add(ctx, address, s.anchor, methods); err != nil {
 		log.ErrorContext(ctx, "Failed to write the registration again", "error", err)
@@ -196,7 +248,8 @@ func (s *GRPCDServer) write(
 			log.ErrorContext(ctx, "Failed to register methods", "error", err)
 
 			return nil, errors.Internal(
-				ctx, "failed to register service", errCodeRegistrationFailed, internal.ErrDomain,
+				ctx, "failed to register service",
+				errCodeRegistrationFailed, internal.ErrDomain,
 			)
 		}
 
@@ -216,16 +269,16 @@ func (s *GRPCDServer) write(
 func (s *GRPCDServer) release(
 	ctx context.Context, log *slog.Logger, address string, methods []string,
 ) {
-	ctx = context.WithoutCancel(ctx)
+	ctxSpan := trace.SpanFromContext(ctx)
+	tracer := ctxSpan.TracerProvider().Tracer(tracerName)
+	ctx, span := tracer.Start(context.WithoutCancel(ctx), "remove")
+	defer span.End()
 
 	if err := s.store.Remove(ctx, address, methods); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		log.ErrorContext(ctx, "Failed to remove methods", "error", err)
 
 		return
-	}
-
-	if s.removalCount != nil {
-		s.removalCount.Add(ctx, 1)
 	}
 
 	log.InfoContext(ctx, "Removed service instance")

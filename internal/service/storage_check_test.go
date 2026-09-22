@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/pbrpc/connect-service/diagnostics"
-	"github.com/pbrpc/otel-testing/mocks/meter"
 
 	"github.com/grpcd/server/internal/storage/mock"
 )
@@ -17,7 +16,7 @@ func newStorageCheckServer(pingErr error) *GRPCDServer {
 	store := mock.NewStore()
 	store.SetPingError(pingErr)
 
-	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, meter.New(), testAnchor)
+	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, testAnchor)
 }
 
 func TestStorageCheck(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"connectrpc.com/connect/v2"
+	"go.opentelemetry.io/otel/codes"
 
 	grpcd "github.com/grpcd/protos"
 
@@ -18,7 +19,7 @@ const method = "/package.Service/Method"
 
 func TestDiscover(t *testing.T) {
 	t.Run("offers a registered address", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		if err := h.store.Add(t.Context(), "10.0.0.1:50054", testAnchor, []string{method}); err != nil {
 			t.Fatalf("failed to seed: %v", err)
@@ -35,7 +36,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("offers the next address after one is reported dead", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		seedTwo(t, h.store)
 
@@ -52,13 +53,17 @@ func TestDiscover(t *testing.T) {
 		if got := h.store.Addresses(method); !slices.Equal(got, []string{"10.0.0.2:50054"}) {
 			t.Errorf("expected the dead address to be removed, got %v", got)
 		}
+
+		h.assertSpans(t, "remove", codes.Unset)
 	})
 
 	t.Run("reinstates a removal it is told about", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
+
+		returned := h.registering()
 
 		if _, err := register(ctx, h.client("10.0.0.1:41234"), registration(method)); err != nil {
 			t.Fatalf("registration was refused: %v", err)
@@ -93,10 +98,17 @@ func TestDiscover(t *testing.T) {
 		if got := h.store.Addresses(method); !slices.Equal(got, []string{"10.0.0.1:50054"}) {
 			t.Errorf("expected the address to be written back, got %v", got)
 		}
+
+		// The span ends after the write; the handler returning is what says it
+		// has.
+		disconnect()
+		await(t, returned, "handler did not return")
+
+		h.assertSpans(t, "revert", codes.Unset)
 	})
 
 	t.Run("leaves a removed row that the holder never registered", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -149,10 +161,12 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("reports when the registration cannot be written again", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
+
+		returned := h.registering()
 
 		if _, err := register(ctx, h.client("10.0.0.1:41234"), registration(method)); err != nil {
 			t.Fatalf("registration was refused: %v", err)
@@ -165,10 +179,15 @@ func TestDiscover(t *testing.T) {
 		h.server.Reinstate(t.Context(), storage.Removal{Method: method, Address: "10.0.0.1:50054"})
 
 		await(t, failed, "the holder never tried to write")
+
+		disconnect()
+		await(t, returned, "handler did not return")
+
+		h.assertSpans(t, "revert", codes.Error)
 	})
 
 	t.Run("waits for a method that is not registered and offers the first to arrive", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		stream, err := h.client("").Discover(t.Context())
 		if err != nil {
@@ -209,7 +228,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("waits after every address is reported dead and offers the next to arrive", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		if err := h.store.Add(t.Context(), "10.0.0.1:50054", testAnchor, []string{method}); err != nil {
 			t.Fatalf("failed to seed: %v", err)
@@ -258,7 +277,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("answers not found instead of waiting when asked not to wait", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		candidates, err := discoverWithoutWaiting(t.Context(), h.client(""), method)
 
@@ -270,7 +289,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("answers not found once every address is reported dead when asked not to wait", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		if err := h.store.Add(t.Context(), "10.0.0.1:50054", testAnchor, []string{method}); err != nil {
 			t.Fatalf("failed to seed: %v", err)
@@ -289,7 +308,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("returns when the caller goes away while waiting", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, leave := context.WithCancel(t.Context())
 		defer leave()
@@ -316,7 +335,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("holds the discovery through a lost store and draws once it returns", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		h.store.SetAddressesForError(errors.New("storage unavailable"))
 		h.store.Lose()
@@ -354,7 +373,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("returns when the caller goes away while the store is lost", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		h.store.SetAddressesForError(errors.New("storage unavailable"))
 		h.store.Lose()
@@ -384,7 +403,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("draws again when the store returns while waiting", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		stream, err := h.client("").Discover(t.Context())
 		if err != nil {
@@ -417,7 +436,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("goes back to sleep when another method registers", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		stream, err := h.client("").Discover(t.Context())
 		if err != nil {
@@ -459,7 +478,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("refuses an invalid method name", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		_, err := discover(t.Context(), h.client(""), "not-a-method")
 
@@ -467,7 +486,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("returns when the request cannot be read", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		stream, err := h.client("").Discover(t.Context())
 		if err != nil {
@@ -487,7 +506,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("returns when the store cannot be read", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		h.store.SetAddressesForError(errors.New("storage unavailable"))
 
@@ -497,7 +516,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("returns when a candidate cannot be sent", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		if err := h.store.Add(t.Context(), "10.0.0.1:50054", testAnchor, []string{method}); err != nil {
 			t.Fatalf("failed to seed: %v", err)
@@ -527,7 +546,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("returns when the report cannot be read", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		if err := h.store.Add(t.Context(), "10.0.0.1:50054", testAnchor, []string{method}); err != nil {
 			t.Fatalf("failed to seed: %v", err)
@@ -561,7 +580,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("ignores a report naming no address", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		seedTwo(t, h.store)
 
@@ -602,7 +621,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("keeps going when a removal fails", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		seedTwo(t, h.store)
 		h.store.SetRemoveFromMethodError(errors.New("storage unavailable"))
@@ -619,10 +638,12 @@ func TestDiscover(t *testing.T) {
 		if !slices.Equal(candidates, want) {
 			t.Errorf("expected %v after the failed removal, got %v", want, candidates)
 		}
+
+		h.assertSpans(t, "remove", codes.Error)
 	})
 
 	t.Run("keeps going when the anchor cannot be told", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		seedTwo(t, h.store)
 		h.store.SetNotifyError(errors.New("storage unavailable"))
@@ -638,7 +659,7 @@ func TestDiscover(t *testing.T) {
 	})
 
 	t.Run("tells nobody about an address with no anchor", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		for _, address := range []string{"10.0.0.1:50054", "10.0.0.2:50054"} {
 			if err := h.store.Add(t.Context(), address, "", []string{method}); err != nil {

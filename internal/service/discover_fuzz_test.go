@@ -27,7 +27,7 @@ func FuzzDiscover_MethodNames(f *testing.F) {
 	f.Add("/Service")
 
 	f.Fuzz(func(t *testing.T, methodName string) {
-		h := newHarness()
+		h := newHarness(t)
 
 		isValid := isValidMethodName(methodName)
 

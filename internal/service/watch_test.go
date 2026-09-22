@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"connectrpc.com/connect/v2"
+	"go.opentelemetry.io/otel/codes"
 	"google.golang.org/protobuf/proto"
 
 	grpcd "github.com/grpcd/protos"
@@ -78,7 +79,7 @@ func told(t *testing.T, stream interface {
 
 func TestWatch(t *testing.T) {
 	t.Run("refuses an invalid method name", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		stream, err := h.client("").Watch(
 			t.Context(), &grpcd.WatchRequest{MethodName: "not-a-method", Address: "10.0.0.1:50054"},
@@ -93,7 +94,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("refuses an empty address", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		stream, err := h.client("").Watch(t.Context(), holding(""))
 		if err != nil {
@@ -106,7 +107,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("returns when the stream cannot be opened", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		rpc := connect.NewServer(loggerInterceptor(h.server.log))
 		grpcdconnect.RegisterGRPCDServiceHandler(rpc, h.server)
@@ -122,7 +123,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("returns when the caller goes away", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, leave := context.WithCancel(t.Context())
 		defer leave()
@@ -139,7 +140,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("tells the holder about a new address when the draw wins", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 		h.server.roll = always
 
 		ctx, leave := context.WithCancel(t.Context())
@@ -164,10 +165,12 @@ func TestWatch(t *testing.T) {
 
 		leave()
 		await(t, returned, "handler did not return")
+
+		h.assertSpans(t, "move", codes.Unset)
 	})
 
 	t.Run("says nothing about other methods or the address held", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 		h.server.roll = always
 
 		ctx, leave := context.WithCancel(t.Context())
@@ -210,7 +213,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("says nothing when the draw loses", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		// Wins only once three addresses serve the method, so the second
 		// registration is told and the first is not. Every draw is reported,
@@ -262,7 +265,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("returns when the count fails", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 		h.server.roll = always
 
 		h.store.SetCountError(errors.New("storage unavailable"))
@@ -283,7 +286,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("holds the watch through a lost store", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 		h.server.roll = always
 
 		ctx, leave := context.WithCancel(t.Context())
@@ -325,7 +328,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("returns when the caller goes away while the store is lost", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 		h.server.roll = always
 
 		ctx, leave := context.WithCancel(t.Context())
@@ -357,7 +360,7 @@ func TestWatch(t *testing.T) {
 	})
 
 	t.Run("returns when the holder cannot be told", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 		h.server.roll = always
 
 		ctx, leave := context.WithCancel(t.Context())
@@ -385,5 +388,7 @@ func TestWatch(t *testing.T) {
 		if err := await(t, returned, "handler did not return"); err == nil {
 			t.Fatal("expected the send failure to be returned")
 		}
+
+		h.assertSpans(t, "move", codes.Error)
 	})
 }

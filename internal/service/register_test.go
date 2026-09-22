@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"connectrpc.com/connect/v2"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // peer is the connection a registering service arrives on: its IP and the
@@ -20,7 +21,7 @@ func TestRegister(t *testing.T) {
 	}
 
 	t.Run("holds the rows for as long as the stream", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -54,10 +55,13 @@ func TestRegister(t *testing.T) {
 				t.Errorf("method %s still holds %v after the stream ended", method, got)
 			}
 		}
+
+		h.assertSpans(t, "register", codes.Unset)
+		h.assertSpans(t, "remove", codes.Unset)
 	})
 
 	t.Run("leaves other addresses serving the method", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		first, disconnectFirst := context.WithCancel(t.Context())
 		defer disconnectFirst()
@@ -84,7 +88,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("refuses a request with no methods", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		_, err := register(t.Context(), h.client(peer), registration())
 
@@ -92,7 +96,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("refuses a request with no port", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		request := registration(methods...)
 		request.Port = 0
@@ -103,7 +107,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("refuses a port outside the range", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		request := registration(methods...)
 		request.Port = 70000
@@ -114,7 +118,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("refuses a connection carrying no peer", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		_, err := register(t.Context(), h.client(""), registration(methods...))
 
@@ -122,7 +126,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("refuses a call carrying no connection info", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		// A bare context is a call the dispatcher never saw.
 		_, err := h.server.address(t.Context(), 50054)
@@ -131,7 +135,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("composes an address from a peer with no port", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		if _, err := register(t.Context(), h.client("/tmp/grpcd.sock"), registration(methods[:1]...)); err != nil {
 			t.Fatalf("registration was refused: %v", err)
@@ -143,17 +147,18 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("refuses when the rows cannot be written", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		h.store.SetAddError(errors.New("storage unavailable"))
 
 		_, err := register(t.Context(), h.client(peer), registration(methods...))
 
 		assertCode(t, err, connect.CodeInternal)
+		h.assertSpans(t, "register", codes.Error)
 	})
 
 	t.Run("removes the rows when the acknowledgement cannot be sent", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -177,10 +182,13 @@ func TestRegister(t *testing.T) {
 		if got := h.store.Addresses(methods[0]); len(got) != 0 {
 			t.Errorf("expected the rows to be removed, got %v", got)
 		}
+
+		h.assertSpans(t, "register", codes.Error)
+		h.assertSpans(t, "remove", codes.Unset)
 	})
 
 	t.Run("returns when the rows cannot be removed", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -198,10 +206,12 @@ func TestRegister(t *testing.T) {
 		if err := await(t, returned, "handler did not return"); err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
+
+		h.assertSpans(t, "remove", codes.Error)
 	})
 
 	t.Run("holds the registration through a lost store and writes it once the store returns", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		h.store.SetAddError(errors.New("storage unavailable"))
 		h.store.Lose()
@@ -241,7 +251,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("returns when the caller leaves while the store is lost", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		h.store.SetAddError(errors.New("storage unavailable"))
 		h.store.Lose()
@@ -266,7 +276,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("rewrites the rows when the store returns while holding", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -298,7 +308,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("keeps holding when the rewrite fails", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -327,7 +337,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("acknowledges once", func(t *testing.T) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()

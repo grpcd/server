@@ -13,7 +13,6 @@ import (
 	"connectrpc.com/connect/v2"
 	"github.com/caarlos0/env/v11"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel"
 
 	"github.com/grpcd/protos/grpcdconnect"
 	connectserver "github.com/pbrpc/connect-server"
@@ -52,17 +51,19 @@ func Run() int {
 
 	serverName := svcCfg.Name
 
-	log, flush, err := pbrpcotel.Init(ctx, serverName, svcCfg.Version)
+	// Registrations are streams this process holds, so what it anchors dies with
+	// it. The id names a channel for the life of the process and is never
+	// referenced afterward, so it needs no coordination and no durability. It
+	// is also the instance id on every span, log line, and metric, so a row's
+	// anchor and the telemetry of the process that wrote it carry one name.
+	anchor := uuid.NewString()
+
+	log, flush, err := pbrpcotel.Init(ctx, serverName, svcCfg.Version, anchor)
 	if err != nil {
 		slog.Default().Error("Failed to initialize telemetry", slog.Any("error", err))
 		return 1
 	}
 	stack.Push(lifecycle.Logged(log, "telemetry", flush))
-
-	// Registrations are streams this process holds, so what it anchors dies with
-	// it. The id names a channel for the life of the process and is never
-	// referenced afterward, so it needs no coordination and no durability.
-	anchor := uuid.NewString()
 
 	host, err := connectserver.FromEnv(log)
 	if err != nil {
@@ -80,7 +81,7 @@ func Run() int {
 		return 1
 	}
 
-	grpcdServer := service.NewGRPCDServer(log, store, otel.Meter(serverName), anchor)
+	grpcdServer := service.NewGRPCDServer(log, store, anchor)
 
 	checks := diagnostics.Checks{service.StorageCheckName: grpcdServer.StorageCheck}
 

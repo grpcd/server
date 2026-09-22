@@ -233,13 +233,24 @@ removal notifications. Instances share state, and Sentinel or Cluster supply HA.
 
 ## Observability
 
-Counters, exported over OpenTelemetry:
+grpcd declares no metrics. Every RPC is a span named by
+[connect-server](https://github.com/pbrpc/connect-server), and the bounded
+work inside a stream is a span of its own under it, each failing when the work
+did:
 
-- `grpcd.registrations.total`
-- `grpcd.removals.total`
-- `grpcd.discoveries.total`
-- `grpcd.removals.reverted.total`
-- `grpcd.rebalances.total`
+- `register`: the rows written and acknowledged, once per `Register`
+- `remove`: the rows removed, once per ended `Register` and once per address
+  reported dead over `Discover`
+- `revert`: the registration written back after a removal at an address this
+  instance still holds
+- `move`: a `Watch` holder told to move
+
+A successful `Discover` is one that returned without error. A collector's
+`spanmetrics` connector counts and times all of these by `span.name` and
+`status.code`, and the RPC spans by `rpc.method` and
+`rpc.connect_rpc.error_code`; nothing in grpcd keeps a count. Every span, log
+line, and metric carries the process's `service.instance.id`, which is also
+the anchor recorded on the rows it registers.
 
 The info and diagnostics services from
 [connect-service](https://github.com/pbrpc/connect-service) report the version

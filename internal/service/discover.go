@@ -6,6 +6,9 @@ import (
 	"io"
 	"log/slog"
 
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"git.sonicoriginal.software/logger"
 
 	grpcd "github.com/grpcd/protos"
@@ -37,7 +40,10 @@ const (
 // method it was for; one that finds its own set still empty goes back to sleep.
 // A caller that asked with no_wait is answered NotFound at that point instead:
 // it is resolving one request and has nothing to wait for.
-func (s *GRPCDServer) Discover(ctx context.Context, stream grpcdconnect.GRPCDServiceDiscoverServerStream) error {
+func (s *GRPCDServer) Discover(
+	ctx context.Context,
+	stream grpcdconnect.GRPCDServiceDiscoverServerStream,
+) error {
 	log := logger.FromContext(ctx).With("peer_address", peerAddress(ctx))
 
 	method, noWait, err := methodName(ctx, stream)
@@ -68,7 +74,8 @@ func (s *GRPCDServer) Discover(ctx context.Context, stream grpcdconnect.GRPCDSer
 				log.ErrorContext(ctx, "Failed to discover method", "error", storeErr)
 
 				return pbrpcerrors.Internal(
-					ctx, "failed to discover method", errCodeDiscoverFailed, internal.ErrDomain,
+					ctx, "failed to discover method",
+					errCodeDiscoverFailed, internal.ErrDomain,
 				)
 			}
 
@@ -82,12 +89,14 @@ func (s *GRPCDServer) Discover(ctx context.Context, stream grpcdconnect.GRPCDSer
 		}
 
 		if noWait {
-			log.InfoContext(ctx, "No addresses for method, not waiting", "candidates_sent", sent)
+			log.InfoContext(ctx, "No addresses for method, not waiting",
+				"candidates_sent", sent)
 
 			return pbrpcerrors.NotFound(ctx, "method", method)
 		}
 
-		log.DebugContext(ctx, "No addresses for method, waiting", "candidates_sent", sent)
+		log.DebugContext(ctx, "No addresses for method, waiting",
+			"candidates_sent", sent)
 
 		// A recovery wakes this too: the store may have gained addresses this
 		// instance was deaf to.
@@ -141,10 +150,6 @@ func (s *GRPCDServer) offer(
 
 	reported, err := stream.Receive()
 	if errors.Is(err, io.EOF) {
-		if s.methodsDiscovered != nil {
-			s.methodsDiscovered.Add(ctx, 1)
-		}
-
 		log.InfoContext(ctx, "Discover successful", "method_address", address)
 
 		return true, nil
@@ -172,7 +177,8 @@ func methodName(
 	method := request.GetMethodName()
 
 	if violations := validate.MethodName(method); len(violations) > 0 {
-		return "", false, pbrpcerrors.InvalidArgument(ctx, "validation failed", violations...)
+		return "", false, pbrpcerrors.InvalidArgument(ctx, "validation failed",
+			violations...)
 	}
 
 	return method, request.GetNoWait(), nil
@@ -190,14 +196,17 @@ func (s *GRPCDServer) reportedDead(
 
 	log = log.With("method_address", address)
 
+	ctxSpan := trace.SpanFromContext(ctx)
+	tracer := ctxSpan.TracerProvider().Tracer(tracerName)
+	ctx, span := tracer.Start(ctx, "remove")
+	defer span.End()
+
 	anchor, err := s.store.RemoveFromMethod(ctx, method, address)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		log.ErrorContext(ctx, "Failed to remove unreachable address", "error", err)
-		return
-	}
 
-	if s.removalCount != nil {
-		s.removalCount.Add(ctx, 1)
+		return
 	}
 
 	log.InfoContext(ctx, "Removed unreachable address")

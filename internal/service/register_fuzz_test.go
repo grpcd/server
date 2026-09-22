@@ -27,7 +27,7 @@ func FuzzRegister_MethodNames(f *testing.F) {
 	f.Add("/Service")
 
 	f.Fuzz(func(t *testing.T, methodName string) {
-		h := newHarness()
+		h := newHarness(t)
 
 		ctx, disconnect := context.WithCancel(t.Context())
 		defer disconnect()
@@ -91,7 +91,7 @@ func FuzzRegister_MethodCounts(f *testing.F) {
 			t.Skip()
 		}
 
-		h := newHarness()
+		h := newHarness(t)
 
 		// Generate N valid method names in gRPC format
 		methods := make([]string, methodCount)
