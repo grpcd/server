@@ -39,8 +39,8 @@ Everything is an environment variable.
 | `STORAGE_ADDRESS`     | Storage backend address. Required for `redis`.                         | -        |
 
 Each `TLS_*` variable holds the material itself, not a path to it.
-`SERVICE_NAME`, `SERVICE_VERSION`, `MAX_CONNECTION_IDLE`,
-`HTTP_SERVER_IDLE_TIMEOUT`, `HTTP2_SEND_PING_TIMEOUT`, `HTTP2_PING_TIMEOUT`,
+`SERVICE_NAME`, `SERVICE_VERSION`, `HOST_IDLE_TIMEOUT`,
+`HTTP2_SEND_PING_TIMEOUT`, `HTTP2_PING_TIMEOUT`,
 `OTEL_*`, and `LOG_FORMAT` are read as on every service across the
 [`pbrpc` ecosystem](https://github.com/pbrpc).
 
