@@ -2,7 +2,6 @@ package service
 
 import (
 	"errors"
-	"log/slog"
 	"testing"
 
 	"github.com/pbrpc/connect-service/diagnostics"
@@ -16,7 +15,7 @@ func newStorageCheckServer(pingErr error) *GRPCDServer {
 	store := mock.NewStore()
 	store.SetPingError(pingErr)
 
-	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, testAnchor)
+	return New(store, testAnchor)
 }
 
 func TestStorageCheck(t *testing.T) {

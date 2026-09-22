@@ -236,7 +236,7 @@ func (s *GRPCDServer) Reinstate(ctx context.Context, removal storage.Removal) {
 	holders := s.holders(removal.Address)
 
 	if len(holders) == 0 {
-		s.log.InfoContext(ctx, "Removed address is held by no stream",
+		logger.FromContext(ctx).InfoContext(ctx, "Removed address is held by no stream",
 			"peer_address", removal.Address, "method_name", removal.Method)
 
 		return

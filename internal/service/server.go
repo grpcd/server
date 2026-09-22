@@ -2,16 +2,12 @@
 package service
 
 import (
-	"log/slog"
 	"math/rand/v2"
 	"sync"
-
-	"git.sonicoriginal.software/logger"
 
 	"github.com/grpcd/protos/grpcdconnect"
 
 	"github.com/grpcd/server/internal/storage"
-	"github.com/grpcd/server/internal/storage/mock"
 )
 
 const (
@@ -24,7 +20,6 @@ const (
 
 // GRPCDServer implements the GRPCDService
 type GRPCDServer struct {
-	log    *slog.Logger
 	store  storage.Store
 	anchor string
 
@@ -47,22 +42,13 @@ func oneIn(n int64) bool {
 	return n > 0 && rand.IntN(int(n)) == 0
 }
 
-// NewGRPCDServer creates a new grpcd server.
+// New creates a new grpcd server.
 //
 // anchor identifies this instance for the life of the process. It is recorded
 // on every address this server registers, so whoever removes one of those rows
 // knows which instance to tell.
-func NewGRPCDServer(log *slog.Logger, store storage.Store, anchor string) *GRPCDServer {
-	if log == nil {
-		log = logger.NewNullLogger()
-	}
-
-	if store == nil {
-		store = mock.NewStore()
-	}
-
+func New(store storage.Store, anchor string) *GRPCDServer {
 	return &GRPCDServer{
-		log:    log,
 		store:  store,
 		anchor: anchor,
 		roll:   oneIn,

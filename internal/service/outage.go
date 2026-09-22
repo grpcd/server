@@ -5,6 +5,8 @@ import (
 
 	"github.com/pbrpc/connect-service/health"
 
+	"git.sonicoriginal.software/logger"
+
 	"github.com/grpcd/protos/grpcdconnect"
 
 	"github.com/grpcd/server/internal/storage"
@@ -49,9 +51,9 @@ func (s *GRPCDServer) ReportHealth(ctx context.Context, healthSrv *health.Server
 
 		switch {
 		case condition.Lost && !lost:
-			s.log.Error("Store lost")
+			logger.FromContext(ctx).ErrorContext(ctx, "Store lost")
 		case !condition.Lost && lost:
-			s.log.Info("Store returned")
+			logger.FromContext(ctx).InfoContext(ctx, "Store returned")
 		}
 
 		lost = condition.Lost

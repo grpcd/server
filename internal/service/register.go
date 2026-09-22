@@ -274,6 +274,8 @@ func (s *GRPCDServer) release(
 	ctx, span := tracer.Start(context.WithoutCancel(ctx), "remove")
 	defer span.End()
 
+	log.InfoContext(ctx, "Removing service instance")
+
 	if err := s.store.Remove(ctx, address, methods); err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		log.ErrorContext(ctx, "Failed to remove methods", "error", err)

@@ -109,7 +109,7 @@ func TestWatch(t *testing.T) {
 	t.Run("returns when the stream cannot be opened", func(t *testing.T) {
 		h := newHarness(t)
 
-		rpc := connect.NewServer(loggerInterceptor(h.server.log))
+		rpc := connect.NewServer(loggerInterceptor())
 		grpcdconnect.RegisterGRPCDServiceHandler(rpc, h.server)
 
 		// The transport's stream refuses the acknowledgement, the one send the

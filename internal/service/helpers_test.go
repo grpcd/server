@@ -31,7 +31,7 @@ const testAnchor = "anchor-under-test"
 func newServer() (*GRPCDServer, *mock.Store) {
 	store := mock.NewStore()
 
-	return NewGRPCDServer(slog.New(slog.DiscardHandler), store, testAnchor), store
+	return New(store, testAnchor), store
 }
 
 // harness serves a GRPCDServer in-process: plain function calls through the
@@ -100,7 +100,7 @@ func (h *harness) assertSpans(t *testing.T, name string, want ...codes.Code) {
 // arrives with none.
 func (h *harness) client(peer string) grpcdconnect.GRPCDServiceClient {
 	interceptors := []connect.ServerInterceptor{
-		loggerInterceptor(h.server.log),
+		loggerInterceptor(),
 		spanInterceptor(h.tracer.Tracer("test")),
 	}
 
@@ -114,9 +114,11 @@ func (h *harness) client(peer string) grpcdconnect.GRPCDServiceClient {
 	return grpcdconnect.NewGRPCDServiceClient(connect.NewClient(connectinprocess.New(rpc)))
 }
 
-// loggerInterceptor puts log in every call's context, the way the foundation's
-// server does, so the handlers log where the server under test does.
-func loggerInterceptor(log *slog.Logger) connect.ServerInterceptor {
+// loggerInterceptor puts a discarding logger in every call's context, so the
+// handlers under test log nowhere instead of through the process default.
+func loggerInterceptor() connect.ServerInterceptor {
+	log := slog.New(slog.DiscardHandler)
+
 	return func(next connect.ServerFunc) connect.ServerFunc {
 		return func(ctx context.Context, spec connect.Spec, stream connect.ServerStream) error {
 			return next(logger.ContextWithLogger(ctx, log), spec, stream)

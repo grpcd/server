@@ -81,7 +81,7 @@ func Run() int {
 		return 1
 	}
 
-	grpcdServer := service.NewGRPCDServer(log, store, anchor)
+	grpcdServer := service.New(store, anchor)
 
 	checks := diagnostics.Checks{service.StorageCheckName: grpcdServer.StorageCheck}
 
