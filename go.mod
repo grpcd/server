@@ -7,7 +7,6 @@ require (
 	git.sonicoriginal.software/logger v0.1.0
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/cenkalti/backoff/v7 v7.0.0
-	github.com/google/uuid v1.6.0
 	github.com/grpcd/protos v0.9.1
 	github.com/pbrpc/connect-errors v0.1.1
 	github.com/pbrpc/connect-protos v0.2.1
@@ -29,6 +28,7 @@ require (
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/pbrpc/connect-client v0.1.1 // indirect
 	github.com/pbrpc/connect-otel v0.1.0 // indirect

@@ -9,10 +9,10 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"uuid"
 
 	"connectrpc.com/connect/v2"
 	"github.com/caarlos0/env/v11"
-	"github.com/google/uuid"
 
 	"github.com/grpcd/protos/grpcdconnect"
 	connectserver "github.com/pbrpc/connect-server"
@@ -56,7 +56,7 @@ func Run() int {
 	// referenced afterward, so it needs no coordination and no durability. It
 	// is also the instance id on every span, log line, and metric, so a row's
 	// anchor and the telemetry of the process that wrote it carry one name.
-	anchor := uuid.NewString()
+	anchor := uuid.New().String()
 
 	log, flush, err := pbrpcotel.Init(ctx, serverName, svcCfg.Version, anchor)
 	if err != nil {
